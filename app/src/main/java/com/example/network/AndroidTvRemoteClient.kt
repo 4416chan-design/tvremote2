@@ -438,7 +438,7 @@ class AndroidTvRemoteClient(
 
     suspend fun sendText(text: String, replaceExisting: Boolean = false, submitWithEnter: Boolean = false) {
         imeMutex.withLock {
-            if (text.isNotEmpty() || !submitWithEnter) {
+            if (text.isNotEmpty() || replaceExisting || !submitWithEnter) {
                 sendBatchEditLocked(text)
                 trackedTvText = text
                 trackedSelStart = text.length
@@ -446,7 +446,7 @@ class AndroidTvRemoteClient(
             }
 
             if (submitWithEnter) {
-                if (text.isNotEmpty()) {
+                if (text.isNotEmpty() || replaceExisting) {
                     kotlinx.coroutines.delay(150)
                 }
                 sendKey(TvKeyCodes.ENTER, DIRECTION_SHORT)

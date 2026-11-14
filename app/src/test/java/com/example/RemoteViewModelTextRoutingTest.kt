@@ -97,23 +97,13 @@ class RemoteViewModelTextRoutingTest {
             assertEquals("TV로 입력을 전송했습니다.", viewModel.snackbarNotice.value?.message)
 
             sentChunks.clear()
-            viewModel.sendKeyboardChars("가나")
             viewModel.sendKeyboardBackspace(1)
             waitUntil(timeoutMs = 2_000) {
-                sentChunks.size >= 2
+                sentChunks.size >= 1
             }
 
-            val charsBatch = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
-            ).first { it.number == 21 }.asMessage()
-            assertEquals(
-                "가나",
-                charsBatch.first { it.number == 3 }.asMessage()
-                    .first { it.number == 2 }.asMessage()
-                    .first { it.number == 3 }.asString()
-            )
             val delKey = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[1]))
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
             ).first { it.number == 10 }.asMessage()
             assertEquals(TvKeyCodes.DEL.toLong(), delKey.first { it.number == 1 }.varint)
             assertEquals(AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), delKey.first { it.number == 2 }.varint)
@@ -124,7 +114,7 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `empty clear sends empty RemoteImeBatchEdit while empty submit sends ENTER only`() {
+    fun `empty clear sends empty RemoteImeBatchEdit and empty submit also clears before ENTER`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -158,14 +148,22 @@ class RemoteViewModelTextRoutingTest {
 
             sentChunks.clear()
 
-            // Pressing "전송" on an empty box (submitWithEnter = true): emits KEYCODE_ENTER only
+            // Pressing "전송" on an empty box (submitWithEnter = true): clears first then emits KEYCODE_ENTER
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
-            waitUntil(timeoutMs = 2_000) { sentChunks.size >= 1 }
-            assertEquals(1, sentChunks.size)
-            val enterFields = ProtobufWire.parseFields(
+            waitUntil(timeoutMs = 2_000) { sentChunks.size >= 2 }
+            assertEquals(2, sentChunks.size)
+            val emptyBatch = ProtobufWire.parseFields(
                 ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
+            ).first { it.number == 21 }.asMessage()
+            assertEquals(
+                "",
+                emptyBatch.first { it.number == 3 }.asMessage()
+                    .first { it.number == 2 }.asMessage()
+                    .first { it.number == 3 }.asString()
             )
-            assertFalse(enterFields.any { it.number == 21 })
+            val enterFields = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[1]))
+            )
             val keyMsg = enterFields.first { it.number == 10 }.asMessage()
             assertEquals(TvKeyCodes.ENTER.toLong(), keyMsg.first { it.number == 1 }.varint)
         } finally {
@@ -175,7 +173,7 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `adbKeyboard installed routes Send through ADB_CLEAR_TEXT and ADB_INPUT_TEXT or B64 and Enter`() {
+    fun `adbKeyboard installed routes Send through ADB_CLEAR_TEXT and ADB_INPUT_TEXT or B64 and Enter even when empty`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -231,6 +229,17 @@ class RemoteViewModelTextRoutingTest {
             assertTrue(koSendCmd.contains("input keyevent 66 2>&1"))
 
             adbCommands.clear()
+            viewModel.clearSnackbar()
+
+            // Empty Send: still runs ADB_CLEAR_TEXT -> ENTER
+            viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
+            waitUntil(timeoutMs = 2_000) { adbCommands.any { it.contains("ADB_CLEAR_TEXT") } }
+            val emptySendCmd = adbCommands.first()
+            assertTrue(emptySendCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
+            assertFalse(emptySendCmd.contains("ADB_INPUT_TEXT"))
+            assertTrue(emptySendCmd.contains("input keyevent 66 2>&1"))
+
+            adbCommands.clear()
 
             // Clear button: ADB_CLEAR_TEXT only (no Enter)
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = false)
@@ -239,13 +248,62 @@ class RemoteViewModelTextRoutingTest {
             assertTrue(clearCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
             assertFalse(clearCmd.contains("input keyevent 66"))
 
-            // Live mode typing with space emits physical KEYCODE_SPACE over Protocol v2
-            viewModel.sendKeyboardChars("ab cd")
-            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 3 }
-            val midFrame = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[1]))
+            // Physical Backspace sends KEYCODE_DEL immediately over Protocol v2
+            viewModel.sendKeyboardBackspace(1)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
+            val backspaceFrame = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
             ).first { it.number == 10 }.asMessage()
-            assertEquals(TvKeyCodes.SPACE.toLong(), midFrame.first { it.number == 1 }.varint)
+            assertEquals(TvKeyCodes.DEL.toLong(), backspaceFrame.first { it.number == 1 }.varint)
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `raw ADB fallback still clears before Enter on empty Send and routes Backspace to DEL`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            val adbCommands = CopyOnWriteArrayList<String>()
+            viewModel.configureRemoteClientForTest(connected = true) {
+                throw java.io.IOException("simulated Protocol v2 write drop")
+            }
+            viewModel.configureAdbClientForTest(connected = true) { cmd ->
+                adbCommands.add(cmd)
+                if (cmd.contains("pm path com.android.adbkeyboard")) {
+                    Result.success("ADBKB=MISSING")
+                } else {
+                    Result.success("")
+                }
+            }
+
+            viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
+            waitUntil(timeoutMs = 3_000) {
+                adbCommands.any { it.contains("input keyevent 123") }
+            }
+            val clearEnterCmd = adbCommands.first { it.contains("input keyevent 123") }
+            assertTrue(clearEnterCmd.contains("67"))
+            assertTrue(clearEnterCmd.contains("input keyevent 66 2>&1"))
+
+            adbCommands.clear()
+            viewModel.sendKeyboardBackspace(1)
+            waitUntil(timeoutMs = 2_000) {
+                adbCommands.any { it.contains("input keyevent 67") }
+            }
+            assertTrue(adbCommands.first { it.contains("input keyevent 67") }.contains("input keyevent 67 2>&1"))
         } finally {
             store.clear()
             db.close()

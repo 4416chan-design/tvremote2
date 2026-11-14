@@ -100,92 +100,93 @@ class NetworkAdbClient(
     suspend fun connect(host: String, port: Int = DEFAULT_ADB_PORT): Boolean = withContext(Dispatchers.IO) {
         ioMutex.withLock {
             if (connectedHost == host && isConnected) {
-                return@withLock true
-            }
-            if (testShellRunner != null && _adbState.value == AdbConnectionState.CONNECTED) {
-                return@withLock true
-            }
-            closeSocketOnly()
-            lastVerifiedHardwareBacklightSupport = null
-            adbKeyboardInstalled = null
-            peerMaxPayload = MAX_PAYLOAD
-            _adbState.value = AdbConnectionState.CONNECTING
-            _adbStatusDetail.value = "TV ADB(5555) 연결 시도 중..."
+                true
+            } else if (testShellRunner != null && _adbState.value == AdbConnectionState.CONNECTED) {
+                true
+            } else {
+                closeSocketOnly()
+                lastVerifiedHardwareBacklightSupport = null
+                adbKeyboardInstalled = null
+                peerMaxPayload = MAX_PAYLOAD
+                _adbState.value = AdbConnectionState.CONNECTING
+                _adbStatusDetail.value = "TV ADB(5555) 연결 시도 중..."
 
-            try {
-                val tcpSocket = Socket().apply {
-                    tcpNoDelay = true
-                    soTimeout = 4_000
-                    connect(InetSocketAddress(host, port), 3_500)
-                }
-                socket = tcpSocket
-                input = tcpSocket.getInputStream()
-                output = tcpSocket.getOutputStream()
+                try {
+                    val tcpSocket = Socket().apply {
+                        tcpNoDelay = true
+                        soTimeout = 4_000
+                        connect(InetSocketAddress(host, port), 3_500)
+                    }
+                    socket = tcpSocket
+                    input = tcpSocket.getInputStream()
+                    output = tcpSocket.getOutputStream()
 
-                val out = output!!
-                val inp = input!!
+                    val out = output!!
+                    val inp = input!!
 
-                sendPacket(
-                    out = out,
-                    command = A_CNXN,
-                    arg0 = A_VERSION,
-                    arg1 = MAX_PAYLOAD,
-                    data = "host::\u0000".toByteArray(Charsets.UTF_8)
-                )
+                    sendPacket(
+                        out = out,
+                        command = A_CNXN,
+                        arg0 = A_VERSION,
+                        arg1 = MAX_PAYLOAD,
+                        data = "host::\u0000".toByteArray(Charsets.UTF_8)
+                    )
 
-                var sentSignature = false
-                var sentPublicKey = false
+                    var sentSignature = false
+                    var sentPublicKey = false
+                    var authenticated = false
 
-                while (true) {
-                    val pkt = readPacket(inp)
-                    when (pkt.command) {
-                        A_CNXN -> {
-                            tcpSocket.soTimeout = 4_500
-                            if (pkt.arg1 > 0) {
-                                peerMaxPayload = pkt.arg1.coerceIn(4_096, MAX_PAYLOAD)
+                    while (!authenticated) {
+                        val pkt = readPacket(inp)
+                        when (pkt.command) {
+                            A_CNXN -> {
+                                tcpSocket.soTimeout = 4_500
+                                if (pkt.arg1 > 0) {
+                                    peerMaxPayload = pkt.arg1.coerceIn(4_096, MAX_PAYLOAD)
+                                }
+                                connectedHost = host
+                                _adbState.value = AdbConnectionState.CONNECTED
+                                _adbStatusDetail.value = "ADB 5555 연결됨"
+                                authenticated = true
                             }
-                            connectedHost = host
-                            _adbState.value = AdbConnectionState.CONNECTED
-                            _adbStatusDetail.value = "ADB 5555 연결됨"
-                            return@withLock true
-                        }
-                        A_AUTH -> {
-                            if (pkt.arg0 == ADB_AUTH_TOKEN) {
-                                if (!sentSignature) {
-                                    sentSignature = true
-                                    val signature = keyManager.signToken(pkt.data)
-                                    sendPacket(out, A_AUTH, ADB_AUTH_SIGNATURE, 0, signature)
-                                } else if (!sentPublicKey) {
-                                    sentPublicKey = true
-                                    _adbState.value = AdbConnectionState.AUTHORIZING
-                                    _adbStatusDetail.value = "TV 화면에서 디버깅 '허용'을 눌러주세요"
-                                    // Give user up to 18s to accept the RSA prompt on the TV screen
-                                    tcpSocket.soTimeout = 18_000
-                                    val pubPayload = keyManager.buildAdbPublicKeyPayload()
-                                    sendPacket(out, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, pubPayload)
-                                } else {
-                                    throw IllegalStateException("TV에서 ADB 인증이 거부되었습니다.")
+                            A_AUTH -> {
+                                if (pkt.arg0 == ADB_AUTH_TOKEN) {
+                                    if (!sentSignature) {
+                                        sentSignature = true
+                                        val signature = keyManager.signToken(pkt.data)
+                                        sendPacket(out, A_AUTH, ADB_AUTH_SIGNATURE, 0, signature)
+                                    } else if (!sentPublicKey) {
+                                        sentPublicKey = true
+                                        _adbState.value = AdbConnectionState.AUTHORIZING
+                                        _adbStatusDetail.value = "TV 화면에서 디버깅 '허용'을 눌러주세요"
+                                        // Give user up to 18s to accept the RSA prompt on the TV screen
+                                        tcpSocket.soTimeout = 18_000
+                                        val pubPayload = keyManager.buildAdbPublicKeyPayload()
+                                        sendPacket(out, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, pubPayload)
+                                    } else {
+                                        throw IllegalStateException("TV에서 ADB 인증이 거부되었습니다.")
+                                    }
                                 }
                             }
+                            else -> Unit
                         }
-                        else -> Unit
                     }
+                    true
+                } catch (t: Throwable) {
+                    closeSocketOnly()
+                    connectedHost = null
+                    _adbState.value = AdbConnectionState.UNAVAILABLE
+                    _adbStatusDetail.value = when {
+                        t.message?.contains("refused", ignoreCase = true) == true ->
+                            "TV 개발자 옵션 > USB/네트워크 디버깅 꺼짐 (포트 5555 닫힘)"
+                        t.message?.contains("timed out", ignoreCase = true) == true ->
+                            "TV ADB 응답 시간 초과 (개발자 옵션 또는 허용 팝업 확인)"
+                        else -> t.message ?: "ADB 연결 실패"
+                    }
+                    false
                 }
-            } catch (t: Throwable) {
-                closeSocketOnly()
-                connectedHost = null
-                _adbState.value = AdbConnectionState.UNAVAILABLE
-                _adbStatusDetail.value = when {
-                    t.message?.contains("refused", ignoreCase = true) == true ->
-                        "TV 개발자 옵션 > USB/네트워크 디버깅 꺼짐 (포트 5555 닫힘)"
-                    t.message?.contains("timed out", ignoreCase = true) == true ->
-                        "TV ADB 응답 시간 초과 (개발자 옵션 또는 허용 팝업 확인)"
-                    else -> t.message ?: "ADB 연결 실패"
-                }
-                return@withLock false
             }
         }
-        false
     }
 
     suspend fun shell(command: String, timeoutMs: Long = 4_500L): Result<String> = withContext(Dispatchers.IO) {
@@ -907,10 +908,7 @@ class NetworkAdbClient(
                 }
                 if (submitWithEnter) {
                     if (clearExisting || text.isNotEmpty()) {
-                        append("; ")
-                    }
-                    if (text.isNotEmpty()) {
-                        append("sleep 0.1; ")
+                        append("; sleep 0.1; ")
                     }
                     append("input keyevent 66 2>&1")
                 }

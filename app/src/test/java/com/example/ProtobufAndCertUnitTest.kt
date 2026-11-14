@@ -785,6 +785,45 @@ class ProtobufAndCertUnitTest {
         assertTrue(clearOnly.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
         assertEquals(false, clearOnly.contains("ADB_INPUT_TEXT"))
         assertEquals(false, clearOnly.contains("input keyevent 66"))
+
+        val clearAndEnter = com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand(
+            text = "",
+            clearExisting = true,
+            submitWithEnter = true
+        )!!
+        assertTrue(clearAndEnter.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1; sleep 0.1; input keyevent 66 2>&1"))
+        assertEquals(false, clearAndEnter.contains("ADB_INPUT_TEXT"))
+        assertEquals(false, clearAndEnter.contains("ADB_INPUT_B64"))
+    }
+
+    @Test
+    fun `sendText on empty string with replaceExisting and submitWithEnter emits clear batch edit before ENTER`() {
+        val sentChunks = mutableListOf<ByteArray>()
+        val client = AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = {},
+            onImeShowRequested = { _, _ -> },
+            onVolumeChanged = { _, _, _ -> },
+            onDisconnected = {}
+        ).apply {
+            testRawBytesSink = { bytes -> sentChunks.add(bytes) }
+        }
+
+        kotlinx.coroutines.runBlocking {
+            client.sendText("", replaceExisting = true, submitWithEnter = true)
+        }
+
+        assertEquals(2, sentChunks.size)
+        val clearBatch = ProtobufWire.parseFields(
+            ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
+        ).first { it.number == 21 }.asMessage()
+        val clearObj = clearBatch.first { it.number == 3 }.asMessage().first { it.number == 2 }.asMessage()
+        assertEquals("", clearObj.first { it.number == 3 }.asString())
+
+        val enterKey = ProtobufWire.parseFields(
+            ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[1]))
+        ).first { it.number == 10 }.asMessage()
+        assertEquals(TvKeyCodes.ENTER.toLong(), enterKey.first { it.number == 1 }.varint)
     }
 
     @Test
@@ -925,7 +964,11 @@ class ProtobufAndCertUnitTest {
                 val badRes = client.installApkBytesOnTv(byteArrayOf(1, 2, 3, 4))
                 assertTrue(badRes.isFailure)
 
-                assertTrue(client.connect("127.0.0.1", server.localPort))
+                val connected = client.connect("127.0.0.1", server.localPort)
+                assertTrue(
+                    "Expected connect success, state=${client.adbState.value}, status=${client.adbStatusDetail.value}",
+                    connected
+                )
                 val installRes = client.installApkBytesOnTv(fakeApk)
                 assertTrue("Expected install success, got ${installRes.exceptionOrNull()}", installRes.isSuccess)
                 assertTrue(client.hasAdbKeyboardIme()) // cached true immediately after install

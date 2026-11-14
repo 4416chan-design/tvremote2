@@ -47,6 +47,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
@@ -60,7 +65,6 @@ import com.example.ui.theme.CharcoalSurface
 import com.example.ui.theme.CharcoalSurfaceElevated
 import com.example.ui.theme.CharcoalWell
 import com.example.ui.theme.MintGreen
-import com.example.ui.theme.MintGreenContainer
 import com.example.ui.theme.OnMintGreen
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
@@ -80,7 +84,6 @@ fun KeyboardInputSheet(
     onOpenAdbKeyboardSetup: () -> Unit = {},
     onSendText: (text: String, replaceExisting: Boolean, submitWithEnter: Boolean) -> Unit,
     onSendKey: (Int) -> Unit,
-    onInsertChars: (String) -> Unit = { onSendText(it, false, false) },
     onBackspace: (Int) -> Unit = { count -> repeat(count) { onSendKey(com.example.data.model.TvKeyCodes.DEL) } },
     onDismiss: () -> Unit
 ) {
@@ -96,8 +99,6 @@ fun KeyboardInputSheet(
         )
     }
     var userEditedLocally by remember { mutableStateOf(false) }
-    var liveSyncMode by remember { mutableStateOf(false) }
-    var lastSyncedCommittedText by remember { mutableStateOf(initialText) }
 
     LaunchedEffect(initialText) {
         if (!userEditedLocally && fieldValue.text.isEmpty() && initialText.isNotEmpty()) {
@@ -105,7 +106,6 @@ fun KeyboardInputSheet(
                 text = initialText,
                 selection = TextRange(initialText.length)
             )
-            lastSyncedCommittedText = initialText
         }
     }
 
@@ -128,7 +128,7 @@ fun KeyboardInputSheet(
                 .padding(horizontal = 22.dp, vertical = 20.dp)
                 .navigationBarsPadding()
         ) {
-            // Header: Keyboard Icon + "키보드 입력" | Live Sync Pill | Close 'X' Circle
+            // Header: Keyboard Icon + "키보드 입력" | Close 'X' Circle
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
@@ -148,7 +148,7 @@ fun KeyboardInputSheet(
                     )
                     val (statusText, statusColor) = when {
                         isAdbConnected && isAdbKeyboardInstalled == true ->
-                            "ADBKeyBoard 연결됨 · 한글/전체 전송 지원" to MintGreen
+                            "ADBKeyBoard 연결됨 · 백스페이스 실시간 · 전체 교체 전송" to MintGreen
                         isAdbConnected && isAdbKeyboardInstalled == false ->
                             "ADBKeyBoard 미설치 · Download APK 설치 필요" to WarningAmber
                         isTvImeVisible ->
@@ -163,39 +163,6 @@ fun KeyboardInputSheet(
                         style = MaterialTheme.typography.labelSmall,
                         color = statusColor
                     )
-                }
-
-                Surface(
-                    color = if (liveSyncMode) MintGreenContainer else CharcoalSurface,
-                    shape = CircleShape,
-                    modifier = Modifier
-                        .height(34.dp)
-                        .clip(CircleShape)
-                        .border(
-                            1.dp,
-                            if (liveSyncMode) MintGreen.copy(alpha = 0.6f) else CharcoalBorder,
-                            CircleShape
-                        )
-                        .clickable {
-                            val nextMode = !liveSyncMode
-                            liveSyncMode = nextMode
-                            if (nextMode && fieldValue.text != lastSyncedCommittedText) {
-                                lastSyncedCommittedText = fieldValue.text
-                                onSendText(fieldValue.text, true, false)
-                            }
-                        }
-                        .testTag("keyboard_mode_live")
-                ) {
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier.padding(horizontal = 12.dp)
-                    ) {
-                        Text(
-                            text = if (liveSyncMode) "실시간 ON" else "실시간 OFF",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (liveSyncMode) MintGreen else TextSecondary
-                        )
-                    }
                 }
 
                 Spacer(modifier = Modifier.width(8.dp))
@@ -257,49 +224,34 @@ fun KeyboardInputSheet(
 
             fun submitCurrentText() {
                 fieldValue = fieldValue.copy(composition = null)
-                val textToSend = fieldValue.text
-                val isPureAscii = textToSend.all { it.code in 0x20..0x7E }
-                if (liveSyncMode && textToSend == lastSyncedCommittedText && textToSend.isNotEmpty() && isPureAscii) {
-                    onSendKey(com.example.data.model.TvKeyCodes.ENTER)
-                } else {
-                    lastSyncedCommittedText = textToSend
-                    onSendText(textToSend, true, true)
-                }
+                onSendText(fieldValue.text, true, true)
             }
 
             OutlinedTextField(
                 value = fieldValue,
                 onValueChange = { next ->
-                    val previous = fieldValue.text
-                    val nextText = next.text
+                    val previousValue = fieldValue
                     userEditedLocally = true
                     fieldValue = next
-                    if (liveSyncMode && nextText != previous) {
-                        when {
-                            nextText.length > previous.length && nextText.startsWith(previous) -> {
-                                onInsertChars(nextText.removePrefix(previous))
-                            }
-                            nextText.length < previous.length && previous.startsWith(nextText) -> {
-                                onBackspace(previous.length - nextText.length)
-                            }
-                            else -> {
-                                val commonPrefix = previous.commonPrefixWith(nextText).length
-                                val removedCount = (previous.length - commonPrefix).coerceAtLeast(0)
-                                if (removedCount > 0) {
-                                    onBackspace(removedCount)
-                                }
-                                val inserted = nextText.substring(commonPrefix)
-                                if (inserted.isNotEmpty()) {
-                                    onInsertChars(inserted)
-                                }
-                            }
-                        }
-                        lastSyncedCommittedText = nextText
+                    val deletedCount = computeRealTimeBackspaceCount(previousValue, next)
+                    if (deletedCount > 0) {
+                        onBackspace(deletedCount)
                     }
                 },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(136.dp)
+                    .onPreviewKeyEvent { keyEvent ->
+                        if (fieldValue.text.isEmpty() &&
+                            keyEvent.type == KeyEventType.KeyDown &&
+                            keyEvent.key == Key.Backspace
+                        ) {
+                            onBackspace(1)
+                            true
+                        } else {
+                            false
+                        }
+                    }
                     .focusRequester(focusRequester)
                     .testTag("tv_keyboard_input_field"),
                 placeholder = {
@@ -344,14 +296,9 @@ fun KeyboardInputSheet(
                         .clip(CircleShape)
                         .border(1.dp, CharcoalBorder, CircleShape)
                         .clickable {
-                            val prevLen = fieldValue.text.length
+                            userEditedLocally = true
                             fieldValue = TextFieldValue("")
-                            lastSyncedCommittedText = ""
-                            if (liveSyncMode && prevLen > 0 && isAdbKeyboardInstalled != true) {
-                                onBackspace(prevLen)
-                            } else {
-                                onSendText("", true, false)
-                            }
+                            onSendText("", true, false)
                         }
                         .testTag("keyboard_clear_button")
                 ) {
@@ -401,5 +348,40 @@ fun KeyboardInputSheet(
                 }
             }
         }
+    }
+}
+
+/**
+ * Returns the number of characters removed by a pure Backspace/deletion edit,
+ * returning 0 for text insertions or Korean Hangul IME syllable composition transitions.
+ */
+internal fun computeRealTimeBackspaceCount(
+    previous: TextFieldValue,
+    next: TextFieldValue
+): Int {
+    val prevText = previous.text
+    val nextText = next.text
+    if (nextText.length >= prevText.length) return 0
+
+    if (!previous.selection.collapsed) {
+        val start = previous.selection.min.coerceIn(0, prevText.length)
+        val end = previous.selection.max.coerceIn(start, prevText.length)
+        val afterDelete = prevText.removeRange(start, end)
+        return if (afterDelete == nextText) {
+            Character.codePointCount(prevText, start, end).coerceAtLeast(0)
+        } else {
+            0
+        }
+    }
+
+    val prefixLen = prevText.commonPrefixWith(nextText).length
+    val prevRemaining = prevText.substring(prefixLen)
+    val nextRemaining = nextText.substring(prefixLen)
+    val suffixLen = prevRemaining.commonSuffixWith(nextRemaining).length
+    return if (prefixLen + suffixLen == nextText.length) {
+        val deleteEnd = (prevText.length - suffixLen).coerceAtLeast(prefixLen)
+        Character.codePointCount(prevText, prefixLen, deleteEnd).coerceAtLeast(0)
+    } else {
+        0
     }
 }

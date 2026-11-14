@@ -343,7 +343,6 @@ class MainActivity : ComponentActivity() {
                         isAdbKeyboardInstalled = adbKeyboardInstalled,
                         onOpenAdbKeyboardSetup = viewModel::openAdbKeyboardSetupDialog,
                         onSendText = viewModel::sendKeyboardText,
-                        onInsertChars = viewModel::sendKeyboardChars,
                         onBackspace = viewModel::sendKeyboardBackspace,
                         onSendKey = viewModel::sendKey,
                         onDismiss = viewModel::dismissKeyboardSheet

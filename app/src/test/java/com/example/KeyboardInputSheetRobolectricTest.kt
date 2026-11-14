@@ -1,13 +1,21 @@
 package com.example
 
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
-import com.example.data.model.TvKeyCodes
+import androidx.compose.ui.test.performTextReplacement
+import androidx.compose.ui.test.pressKey
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import com.example.ui.components.AdbKeyboardSetupDialog
 import com.example.ui.components.KeyboardInputSheet
+import com.example.ui.components.computeRealTimeBackspaceCount
 import com.example.ui.theme.TvRemoteTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -23,11 +31,12 @@ class KeyboardInputSheetRobolectricTest {
     @get:Rule
     val composeRule = createComposeRule()
 
+    @OptIn(ExperimentalTestApi::class)
     @Test
-    fun `default mode sends text with enter on submit and live sync sends enter only for unchanged ASCII`() {
+    fun `live mode is removed, only Backspace sends in real time, and Send always replaces and submits`() {
         val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
-        val insertedChars = mutableListOf<String>()
         val sentKeys = mutableListOf<Int>()
+        val backspaceCalls = mutableListOf<Int>()
 
         composeRule.setContent {
             TvRemoteTheme {
@@ -35,58 +44,146 @@ class KeyboardInputSheetRobolectricTest {
                     tvName = "Living Room TV",
                     initialText = "",
                     isTvImeVisible = false,
-                    isAdbConnected = false,
+                    isAdbConnected = true,
+                    isAdbKeyboardInstalled = true,
                     onSendText = { text, replaceExisting, submitWithEnter ->
                         sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
                     },
                     onSendKey = { key -> sentKeys.add(key) },
-                    onInsertChars = { chars -> insertedChars.add(chars) },
-                    onBackspace = {},
+                    onBackspace = { count -> backspaceCalls.add(count) },
                     onDismiss = {}
                 )
             }
         }
 
-        // Status subtitle should guide the user accurately regardless of IME visibility
-        composeRule.onNodeWithText("TV 검색창/키보드를 연 상태에서 입력 후 전송하세요").assertExists()
+        // Live mode toggle pill must be removed
+        composeRule.onNodeWithTag("keyboard_mode_live").assertDoesNotExist()
+        composeRule.onNodeWithText("ADBKeyBoard 연결됨 · 백스페이스 실시간 · 전체 교체 전송").assertExists()
 
-        // Default mode (실시간 OFF): typing and pressing "전송" sends full text + ENTER
-        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextInput("유튜브 검색")
+        // Pressing Backspace when empty sends physical Backspace immediately
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performClick()
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performKeyInput {
+            pressKey(Key.Backspace)
+        }
+        assertEquals(listOf(1), backspaceCalls)
+        assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
+
+        // Pressing Send even when empty clears -> inputs nothing -> sends ENTER (replaceExisting=true, submitWithEnter=true)
         composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
-
-        assertEquals(listOf(Triple("유튜브 검색", true, true)), sentTexts)
+        assertEquals(listOf(Triple("", true, true)), sentTexts)
         assertEquals(emptyList<Int>(), sentKeys)
 
-        // Pressing "전체 지우기" sends empty string clear without ENTER
+        // Typing Korean/ASCII does NOT stream characters or trigger Backspace
+        sentTexts.clear()
+        backspaceCalls.clear()
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextInput("유튜브")
+        assertEquals(emptyList<Int>(), backspaceCalls)
+        assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
+
+        // Deleting a character via Backspace inside the field immediately emits physical Backspace
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performKeyInput {
+            pressKey(Key.Backspace)
+        }
+        assertEquals(listOf(1), backspaceCalls)
+
+        // Modifying text and pressing Send always invokes full clear -> input -> Enter
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("유튜브 검색")
+        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
+        assertEquals(listOf(Triple("유튜브 검색", true, true)), sentTexts)
+
+        // Even unchanged ASCII text always goes through full clear -> input -> Enter (no Enter-only shortcut)
+        sentTexts.clear()
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("bts")
+        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
+        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
+        assertEquals(
+            listOf(
+                Triple("bts", true, true),
+                Triple("bts", true, true)
+            ),
+            sentTexts
+        )
+
+        // Clicking "전체 지우기" always sends full clear without Enter
         sentTexts.clear()
         composeRule.onNodeWithTag("keyboard_clear_button").performClick()
         assertEquals(listOf(Triple("", true, false)), sentTexts)
-
-        // Turn on live sync mode, type English "hello world", then press "전송":
-        // unchanged live ASCII only sends ENTER (no duplication).
-        sentTexts.clear()
-        insertedChars.clear()
-        sentKeys.clear()
-        composeRule.onNodeWithTag("keyboard_mode_live").performClick()
-        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextInput("hello world")
-        assertEquals(listOf("hello world"), insertedChars)
-
-        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
-        assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
-        assertEquals(listOf(TvKeyCodes.ENTER), sentKeys)
-
-        // Clear and type Korean while live mode is still ON: pressing "전송" clears and replaces full Korean text
-        composeRule.onNodeWithTag("keyboard_clear_button").performClick()
-        sentTexts.clear()
-        sentKeys.clear()
-        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextInput("고양이")
-        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
-        assertEquals(listOf(Triple("고양이", true, true)), sentTexts)
-        assertEquals(emptyList<Int>(), sentKeys)
     }
 
     @Test
-    fun `missing ADBKeyBoard shows setup banner and live clear with installed ADBKeyBoard uses ADB_CLEAR_TEXT`() {
+    fun `computeRealTimeBackspaceCount handles pure deletions and ignores Korean syllable composition`() {
+        // Korean Hangul composition must NOT trigger Backspace
+        assertEquals(
+            0,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("ㄱ", selection = TextRange(1), composition = TextRange(0, 1)),
+                TextFieldValue("가", selection = TextRange(1), composition = TextRange(0, 1))
+            )
+        )
+        assertEquals(
+            0,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("한", selection = TextRange(1), composition = TextRange(0, 1)),
+                TextFieldValue("하나", selection = TextRange(2), composition = TextRange(1, 2))
+            )
+        )
+        assertEquals(
+            0,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("한", selection = TextRange(1), composition = TextRange(0, 1)),
+                TextFieldValue("하", selection = TextRange(1), composition = TextRange(0, 1))
+            )
+        )
+
+        // Pure deletions emit exact count
+        assertEquals(
+            1,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("안녕", selection = TextRange(2)),
+                TextFieldValue("안", selection = TextRange(1))
+            )
+        )
+        assertEquals(
+            1,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("a", selection = TextRange(1)),
+                TextFieldValue("", selection = TextRange(0))
+            )
+        )
+        assertEquals(
+            1,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("hello world", selection = TextRange(5)),
+                TextFieldValue("hell world", selection = TextRange(4))
+            )
+        )
+        assertEquals(
+            2,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("가나다", selection = TextRange(0, 2)),
+                TextFieldValue("다", selection = TextRange(0))
+            )
+        )
+        // Selection replacement (typing new char over 2 selected chars) is NOT Backspace
+        assertEquals(
+            0,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("가나다", selection = TextRange(0, 2)),
+                TextFieldValue("ㅁ다", selection = TextRange(1))
+            )
+        )
+        // Deleting a single supplementary emoji sends 1 Backspace instead of 2 UTF-16 code units
+        assertEquals(
+            1,
+            computeRealTimeBackspaceCount(
+                TextFieldValue("a😀", selection = TextRange(3)),
+                TextFieldValue("a", selection = TextRange(1))
+            )
+        )
+    }
+
+    @Test
+    fun `missing ADBKeyBoard shows setup banner and clear sends ADB_CLEAR_TEXT`() {
         var openSetupCalls = 0
         val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
         val backspaceCalls = mutableListOf<Int>()
@@ -104,7 +201,6 @@ class KeyboardInputSheetRobolectricTest {
                         sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
                     },
                     onSendKey = {},
-                    onInsertChars = {},
                     onBackspace = { count -> backspaceCalls.add(count) },
                     onDismiss = {}
                 )
@@ -114,37 +210,6 @@ class KeyboardInputSheetRobolectricTest {
         composeRule.onNodeWithTag("adb_keyboard_setup_banner").performClick()
         assertEquals(1, openSetupCalls)
 
-        composeRule.onNodeWithTag("keyboard_clear_button").performClick()
-        assertEquals(listOf(Triple("", true, false)), sentTexts)
-        assertEquals(emptyList<Int>(), backspaceCalls)
-    }
-
-    @Test
-    fun `live sync clear uses ADB_CLEAR_TEXT when ADBKeyBoard is installed and setup dialog actions work`() {
-        val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
-        val backspaceCalls = mutableListOf<Int>()
-
-        composeRule.setContent {
-            TvRemoteTheme {
-                KeyboardInputSheet(
-                    tvName = "Xiaomi TV",
-                    initialText = "hello",
-                    isTvImeVisible = true,
-                    isAdbConnected = true,
-                    isAdbKeyboardInstalled = true,
-                    onOpenAdbKeyboardSetup = {},
-                    onSendText = { text, replaceExisting, submitWithEnter ->
-                        sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
-                    },
-                    onSendKey = {},
-                    onInsertChars = {},
-                    onBackspace = { count -> backspaceCalls.add(count) },
-                    onDismiss = {}
-                )
-            }
-        }
-
-        composeRule.onNodeWithTag("keyboard_mode_live").performClick()
         composeRule.onNodeWithTag("keyboard_clear_button").performClick()
         assertEquals(listOf(Triple("", true, false)), sentTexts)
         assertEquals(emptyList<Int>(), backspaceCalls)
@@ -174,10 +239,10 @@ class KeyboardInputSheetRobolectricTest {
         }
 
         composeRule.onNodeWithText("Download/keyboardservice-debug.apk").assertExists()
-        composeRule.onNodeWithTag("adb_kb_pick_apk_button").performClick()
-        composeRule.onNodeWithTag("adb_kb_open_tv_downloads_button").performClick()
-        composeRule.onNodeWithTag("adb_kb_redownload_button").performClick()
-        composeRule.onNodeWithTag("adb_kb_verify_button").performClick()
+        composeRule.onNodeWithTag("adb_kb_pick_apk_button").performScrollTo().performClick()
+        composeRule.onNodeWithTag("adb_kb_open_tv_downloads_button").performScrollTo().performClick()
+        composeRule.onNodeWithTag("adb_kb_redownload_button").performScrollTo().performClick()
+        composeRule.onNodeWithTag("adb_kb_verify_button").performScrollTo().performClick()
         composeRule.onNodeWithTag("adb_kb_dismiss_button").performClick()
 
         assertEquals(1, pickClicks)
