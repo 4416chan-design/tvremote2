@@ -75,9 +75,9 @@ fun KeyboardInputSheet(
     isTvImeVisible: Boolean = false,
     isAdbConnected: Boolean = false,
     onSendText: (text: String, replaceExisting: Boolean, submitWithEnter: Boolean) -> Unit,
+    onSendKey: (Int) -> Unit,
     onInsertChars: (String) -> Unit = { onSendText(it, false, false) },
     onBackspace: (Int) -> Unit = { count -> repeat(count) { onSendKey(com.example.data.model.TvKeyCodes.DEL) } },
-    onSendKey: (Int) -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
