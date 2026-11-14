@@ -64,7 +64,7 @@ object ProtobufWire {
 
     fun encode(build: Writer.() -> Unit): ByteArray = Writer().apply(build).toByteArray()
 
-    fun writeFramedMessage(out: OutputStream, payload: ByteArray) {
+    fun frameMessage(payload: ByteArray): ByteArray {
         val frame = ByteArrayOutputStream(payload.size + 5)
         var v = payload.size
         while ((v and -128) != 0) {
@@ -73,7 +73,11 @@ object ProtobufWire {
         }
         frame.write(v and 0x7F)
         frame.write(payload)
-        out.write(frame.toByteArray())
+        return frame.toByteArray()
+    }
+
+    fun writeFramedMessage(out: OutputStream, payload: ByteArray) {
+        out.write(frameMessage(payload))
         out.flush()
     }
 

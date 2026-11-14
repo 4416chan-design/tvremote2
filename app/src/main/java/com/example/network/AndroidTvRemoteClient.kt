@@ -48,6 +48,21 @@ class AndroidTvRemoteClient(
     private var fieldCounter: Int = 0
 
     @Volatile
+    private var syncedImeCounter: Int = -1
+
+    @Volatile
+    private var syncedFieldCounter: Int = -1
+
+    @Volatile
+    private var syncedTextInt5: Int = -1
+
+    @Volatile
+    private var syncedTextLabel: String = ""
+
+    @Volatile
+    private var syncedAppInfoBytes: ByteArray? = null
+
+    @Volatile
     private var trackedTvText: String = ""
 
     @Volatile
@@ -76,8 +91,25 @@ class AndroidTvRemoteClient(
     internal val debugFieldCounter: Int
         get() = fieldCounter
 
+    internal val debugSyncedImeCounter: Int
+        get() = syncedImeCounter
+
+    internal val debugSyncedFieldCounter: Int
+        get() = syncedFieldCounter
+
+    internal val debugSyncedTextInt5: Int
+        get() = syncedTextInt5
+
+    internal val debugSyncedTextLabel: String
+        get() = syncedTextLabel
+
+    internal val debugForegroundPackage: String?
+        get() = currentForegroundPackage
+
     internal val debugTrackedText: String
         get() = trackedTvText
+
+    internal var testRawBytesSink: ((ByteArray) -> Unit)? = null
 
     suspend fun connect(host: String, remotePort: Int) = withContext(Dispatchers.IO) {
         disconnect(notify = false)
@@ -118,17 +150,9 @@ class AndroidTvRemoteClient(
         }
         sendRaw(configurePayload)
 
-        // Wait for remote_set_active from TV, then acknowledge
+        // Wait for remote_set_active (or initial remote messages) from TV and acknowledge
         val activeFrame = ProtobufWire.readFramedMessage(input)
         val activeFields = ProtobufWire.parseFields(activeFrame)
-        if (activeFields.any { it.number == 2 }) {
-            val activeReply = ProtobufWire.encode {
-                writeMessageField(2) {
-                    writeVarintField(1, REMOTE_FEATURES)
-                }
-            }
-            sendRaw(activeReply)
-        }
         handleIncomingFields(activeFields)
 
         isConnected = true
@@ -165,6 +189,14 @@ class AndroidTvRemoteClient(
     private suspend fun handleIncomingFields(fields: List<ProtobufWire.Field>) {
         for (field in fields) {
             when (field.number) {
+                2 -> { // remote_set_active
+                    val activeReply = ProtobufWire.encode {
+                        writeMessageField(2) {
+                            writeVarintField(1, REMOTE_FEATURES)
+                        }
+                    }
+                    sendRaw(activeReply)
+                }
                 3 -> { // remote_error
                     val errFields = field.asMessage()
                     val code = errFields.firstOrNull { it.number == 1 }?.varint?.toInt() ?: -1
@@ -188,8 +220,12 @@ class AndroidTvRemoteClient(
                 }
                 20 -> { // remote_ime_key_inject (reports active app & IME status)
                     val imeFields = field.asMessage()
-                    val appInfo = imeFields.firstOrNull { it.number == 1 && it.wireType == 2 }?.asMessage()
+                    val appInfoField = imeFields.firstOrNull { it.number == 1 && it.wireType == 2 }
+                    if (appInfoField != null) {
+                        syncedAppInfoBytes = appInfoField.bytes
+                    }
                     // RemoteAppInfo.app_package is field 12 (string); field 3 is int3 (varint)
+                    val appInfo = appInfoField?.asMessage()
                     val pkg = appInfo?.firstOrNull { it.number == 12 && it.wireType == 2 }?.asString()
                     if (!pkg.isNullOrBlank()) {
                         val previousPkg = currentForegroundPackage
@@ -201,7 +237,7 @@ class AndroidTvRemoteClient(
                         }
                         onForegroundAppChanged(pkg)
                     }
-                    val textStatus = imeFields.firstOrNull { it.number == 2 }?.asMessage()
+                    val textStatus = imeFields.firstOrNull { it.number == 2 && it.wireType == 2 }?.asMessage()
                     if (textStatus != null) {
                         val wasActive = isImeFieldActive
                         val prevFieldCounter = fieldCounter
@@ -209,7 +245,7 @@ class AndroidTvRemoteClient(
                         notifyImeActivationIfNeeded(wasActive, prevFieldCounter)
                     }
                 }
-                21 -> { // remote_ime_batch_edit (TV echoes/acknowledges updated ime_counter, field_counter & text)
+                21 -> { // remote_ime_batch_edit (TV echoes/acknowledges updated ime_counter & field_counter)
                     val batchFields = field.asMessage()
                     val wasActive = isImeFieldActive
                     val prevFieldCounter = fieldCounter
@@ -228,11 +264,12 @@ class AndroidTvRemoteClient(
                         syncImeTextStatus(textStatus, isShowRequest = true)
                     } else {
                         imeCounter = 0
+                        syncedImeCounter = -1
                         trackedTvText = ""
                         trackedSelStart = 0
                         trackedSelEnd = 0
                     }
-                    onImeShowRequested(fieldCounter, trackedTvText)
+                    onImeShowRequested(resolvedImeFieldCounter(), trackedTvText)
                 }
                 30 -> { // remote_voice_begin (TV requests phone mic stream with session_id)
                     val (sessionId, pkg) = parseVoiceBegin(field.asMessage())
@@ -261,13 +298,18 @@ class AndroidTvRemoteClient(
     private fun notifyImeActivationIfNeeded(wasActive: Boolean, prevFieldCounter: Int) {
         if (isImeFieldActive && (!wasActive || fieldCounter != prevFieldCounter)) {
             lastImeAppPackage = currentForegroundPackage
-            onImeShowRequested(fieldCounter, trackedTvText)
+            onImeShowRequested(resolvedImeFieldCounter(), trackedTvText)
         }
     }
 
     private fun resetImeState() {
         imeCounter = 0
         fieldCounter = 0
+        syncedImeCounter = -1
+        syncedFieldCounter = -1
+        syncedTextInt5 = -1
+        syncedTextLabel = ""
+        syncedAppInfoBytes = null
         trackedTvText = ""
         trackedSelStart = 0
         trackedSelEnd = 0
@@ -276,18 +318,22 @@ class AndroidTvRemoteClient(
         currentForegroundPackage = null
     }
 
+    internal fun resolvedImeFieldCounter(): Int = when {
+        syncedFieldCounter >= 0 -> syncedFieldCounter
+        fieldCounter > 0 -> fieldCounter
+        else -> 1
+    }
+
     private fun syncIncomingImeBatchEdit(batchFields: List<ProtobufWire.Field>) {
-        val tvFieldCounter = batchFields.firstOrNull { it.number == 2 }?.varint?.toInt()
-        val fieldChanged = tvFieldCounter != null && tvFieldCounter != fieldCounter
-        if (tvFieldCounter != null) {
-            fieldCounter = tvFieldCounter
-            if (tvFieldCounter > 0) {
-                isImeFieldActive = true
-            }
+        val tvImeCounter = batchFields.firstOrNull { it.number == 1 }?.varint?.toInt() ?: 0
+        val tvFieldCounter = batchFields.firstOrNull { it.number == 2 }?.varint?.toInt() ?: 0
+        syncedImeCounter = tvImeCounter
+        syncedFieldCounter = tvFieldCounter
+        imeCounter = tvImeCounter
+        fieldCounter = tvFieldCounter
+        if (tvFieldCounter > 0) {
+            isImeFieldActive = true
         }
-        // Always adopt the TV's authoritative ime_counter (proto3 omits 0 on the wire).
-        val tvImeCounter = batchFields.firstOrNull { it.number == 1 }?.varint?.toInt()
-        imeCounter = tvImeCounter ?: if (fieldChanged) 0 else imeCounter
         val edits = batchFields.filter { it.number == 3 }
         for (editField in edits) {
             val editMsg = editField.asMessage()
@@ -301,30 +347,37 @@ class AndroidTvRemoteClient(
     }
 
     private fun syncImeTextStatus(textStatus: List<ProtobufWire.Field>, isShowRequest: Boolean) {
-        val incomingFc = textStatus.firstOrNull { it.number == 1 }?.varint?.toInt()
-        val incomingValue = textStatus.firstOrNull { it.number == 2 }?.asString()
+        val incomingFc = textStatus.firstOrNull { it.number == 1 }?.varint?.toInt() ?: 0
+        val incomingValue = textStatus.firstOrNull { it.number == 2 }?.asString() ?: ""
         val incomingStart = textStatus.firstOrNull { it.number == 3 }?.varint?.toInt()
         val incomingEnd = textStatus.firstOrNull { it.number == 4 }?.varint?.toInt()
+        val incomingInt5 = textStatus.firstOrNull { it.number == 5 }?.varint?.toInt()
+        val incomingLabel = textStatus.firstOrNull { it.number == 6 }?.asString()
         // NOTE: RemoteTextFieldStatus field 5 (int5) is TV EditorInfo attribute/inputType flags, NOT ime_counter!
 
-        val fieldChanged = incomingFc != null && incomingFc != fieldCounter
-        if (incomingFc != null) {
-            fieldCounter = incomingFc
-            if (incomingFc > 0) {
-                isImeFieldActive = true
-            }
+        // Accept fieldCounter = 0 (NVIDIA Shield sends 0 for all fields)
+        syncedFieldCounter = incomingFc
+        fieldCounter = incomingFc
+        if (incomingInt5 != null) {
+            syncedTextInt5 = incomingInt5
+        }
+        if (incomingLabel != null) {
+            syncedTextLabel = incomingLabel
+        }
+        if (isShowRequest || incomingFc > 0 || incomingValue.isNotEmpty() || (incomingInt5 != null && incomingInt5 >= 0)) {
+            isImeFieldActive = true
         }
 
-        // Proto3 omits default empty string "" and 0 indices on wire; RemoteTextFieldStatus is a full snapshot.
-        trackedTvText = incomingValue ?: ""
+        trackedTvText = incomingValue
         val safeLen = trackedTvText.length
         val selStart = (incomingStart ?: if (trackedTvText.isEmpty()) 0 else safeLen).coerceIn(0, safeLen)
         val selEnd = (incomingEnd ?: selStart).coerceIn(selStart, safeLen)
         trackedSelStart = selStart
         trackedSelEnd = selEnd
 
-        if (isShowRequest || fieldChanged) {
+        if (isShowRequest) {
             imeCounter = 0
+            syncedImeCounter = -1
         }
     }
 
@@ -367,27 +420,42 @@ class AndroidTvRemoteClient(
     }
 
     /**
-     * Sends UTF-8 text (Korean Hangul & English) to TV IME via RemoteImeBatchEdit.
-     * Matches the reference Android TV Remote v2 client (androidtvremote2):
-     * insert = 1, value = full resulting field text, start = end = cursor (len - 1),
-     * ime_counter/field_counter = latest values reported by the TV (not incremented locally).
+     * Ported from harimoradiya/androidtvremote RemoteSession.sendText:
+     * sends RemoteImeKeyInject (part1) + RemoteImeBatchEdit with insert=1 (part2) in a single flush.
      */
+    private suspend fun sendImeSyncPacketLocked(text: String, imeCounterCandidate: Int) {
+        val resolvedIme = if (syncedImeCounter >= 0) syncedImeCounter else imeCounterCandidate.coerceAtLeast(0)
+        val resolvedField = resolvedImeFieldCounter()
+
+        val part1 = buildImeTextPayload(
+            text = text,
+            fieldCounter = resolvedField,
+            int5 = syncedTextInt5,
+            label = syncedTextLabel,
+            appInfoBytes = syncedAppInfoBytes
+        )
+        val part2 = buildImeBatchEditPayload(
+            imeCounter = resolvedIme,
+            fieldCounter = resolvedField,
+            text = text,
+            start = text.length,
+            end = text.length,
+            insert = 1
+        )
+
+        val combined = ProtobufWire.frameMessage(part1) + ProtobufWire.frameMessage(part2)
+        sendFramedBytes(combined)
+        syncedImeCounter = resolvedIme
+        syncedFieldCounter = resolvedField
+    }
+
     suspend fun sendText(text: String, replaceExisting: Boolean = false, submitWithEnter: Boolean = false) {
         imeMutex.withLock {
-            val currentLength = trackedTvText.length
-            val startPos = if (replaceExisting) 0 else trackedSelStart.coerceIn(0, currentLength)
-            val endPos = if (replaceExisting) currentLength else trackedSelEnd.coerceIn(startPos, currentLength)
-            val newText = applyTextEdit(trackedTvText, startPos, endPos, text)
-
-            val payload = buildImeBatchEditPayload(
-                imeCounter = imeCounter,
-                fieldCounter = fieldCounter,
-                text = newText
-            )
-            sendRaw(payload)
-            trackedTvText = newText
-            trackedSelStart = newText.length
-            trackedSelEnd = newText.length
+            val currentCounter = ++imeCounter
+            sendImeSyncPacketLocked(text = text, imeCounterCandidate = currentCounter)
+            trackedTvText = text
+            trackedSelStart = text.length
+            trackedSelEnd = text.length
 
             if (submitWithEnter) {
                 kotlinx.coroutines.delay(150)
@@ -396,10 +464,49 @@ class AndroidTvRemoteClient(
         }
     }
 
-    private suspend fun sendRaw(payload: ByteArray) = withContext(Dispatchers.IO) {
+    /**
+     * Ported from harimoradiya/androidtvremote TvRemoteViewModel.sendKeyboardText:
+     * transmits each inserted character with synced fieldCounter & incrementing imeCounter.
+     */
+    suspend fun sendKeyboardChars(text: String) {
+        if (text.isEmpty()) return
+        imeMutex.withLock {
+            for (ch in text) {
+                val currentCounter = imeCounter++
+                sendImeSyncPacketLocked(text = ch.toString(), imeCounterCandidate = currentCounter)
+                trackedTvText += ch
+                trackedSelStart = trackedTvText.length
+                trackedSelEnd = trackedTvText.length
+            }
+        }
+    }
+
+    suspend fun sendKeyboardBackspace(count: Int = 1) {
+        if (count <= 0) return
+        imeMutex.withLock {
+            repeat(count) {
+                sendKey(TvKeyCodes.DEL, DIRECTION_SHORT)
+                if (trackedTvText.isNotEmpty()) {
+                    trackedTvText = trackedTvText.dropLast(1)
+                    trackedSelStart = trackedTvText.length
+                    trackedSelEnd = trackedTvText.length
+                }
+            }
+        }
+    }
+
+    private suspend fun sendRaw(payload: ByteArray) = sendFramedBytes(ProtobufWire.frameMessage(payload))
+
+    private suspend fun sendFramedBytes(framedBytes: ByteArray) = withContext(Dispatchers.IO) {
         writeMutex.withLock {
+            val sink = testRawBytesSink
+            if (sink != null && output == null) {
+                sink(framedBytes)
+                return@withLock
+            }
             val out = output ?: throw IllegalStateException("TV에 연결되어 있지 않습니다.")
-            ProtobufWire.writeFramedMessage(out, payload)
+            out.write(framedBytes)
+            out.flush()
         }
     }
 
@@ -457,15 +564,46 @@ class AndroidTvRemoteClient(
             }
         }
 
-        /**
-         * @param text full resulting text of the TV field (not a delta)
-         * @param cursor cursor index reported to the TV; defaults to reference value len - 1 (min 0)
-         */
+        fun buildImeTextPayload(
+            text: String,
+            fieldCounter: Int,
+            int5: Int = -1,
+            label: String = "",
+            appInfoBytes: ByteArray? = null
+        ): ByteArray = ProtobufWire.encode {
+            val cursor = text.length
+            writeMessageField(20) { // remote_ime_key_inject
+                if (appInfoBytes != null && appInfoBytes.isNotEmpty()) {
+                    writeBytesField(1, appInfoBytes) // app_info
+                }
+                writeMessageField(2) { // text_field_status (RemoteTextFieldStatus)
+                    if (fieldCounter != 0) {
+                        writeVarintField(1, fieldCounter)
+                    }
+                    if (text.isNotEmpty()) {
+                        writeStringField(2, text)
+                    }
+                    if (cursor != 0) {
+                        writeVarintField(3, cursor)
+                        writeVarintField(4, cursor)
+                    }
+                    if (int5 >= 0) {
+                        writeVarintField(5, int5)
+                    }
+                    if (label.isNotEmpty()) {
+                        writeStringField(6, label)
+                    }
+                }
+            }
+        }
+
         fun buildImeBatchEditPayload(
             imeCounter: Int,
             fieldCounter: Int,
             text: String,
             cursor: Int = (text.length - 1).coerceAtLeast(0),
+            start: Int = cursor,
+            end: Int = cursor,
             insert: Int = 1
         ): ByteArray = ProtobufWire.encode {
             writeMessageField(21) { // remote_ime_batch_edit
@@ -474,8 +612,8 @@ class AndroidTvRemoteClient(
                 writeMessageField(3) { // edit_info (RemoteEditInfo)
                     writeVarintField(1, insert)
                     writeMessageField(2) { // text_field_status (RemoteImeObject)
-                        writeVarintField(1, cursor)
-                        writeVarintField(2, cursor)
+                        writeVarintField(1, start)
+                        writeVarintField(2, end)
                         writeStringField(3, text)
                     }
                 }

@@ -369,6 +369,7 @@ class NetworkAdbClient(
                 append("PREV_IME=\$(settings get secure default_input_method 2>/dev/null); ")
                 append("ime enable com.android.adbkeyboard/.AdbIME >/dev/null 2>&1; ")
                 append("ime set com.android.adbkeyboard/.AdbIME >/dev/null 2>&1; ")
+                append("sleep 0.2; ")
                 append("am broadcast -a ADB_INPUT_B64 --es msg '$b64' >/dev/null 2>&1; ")
                 append("if [ -n \"\$PREV_IME\" ] && [ \"\$PREV_IME\" != \"null\" ]; then ime set \"\$PREV_IME\" >/dev/null 2>&1; fi")
                 append(enterSuffix)
@@ -403,10 +404,12 @@ class NetworkAdbClient(
     }
 
     suspend fun hasAdbKeyboardIme(): Boolean {
-        adbKeyboardInstalled?.let { return it }
-        val res = shell("ime list -s 2>/dev/null").getOrNull().orEmpty()
+        if (adbKeyboardInstalled == true) return true
+        val res = shell("ime list -a -s 2>/dev/null").getOrNull().orEmpty()
         val installed = res.contains("com.android.adbkeyboard/.AdbIME", ignoreCase = true)
-        adbKeyboardInstalled = installed
+        if (installed) {
+            adbKeyboardInstalled = true
+        }
         return installed
     }
 

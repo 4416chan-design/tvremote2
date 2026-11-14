@@ -75,6 +75,8 @@ fun KeyboardInputSheet(
     isTvImeVisible: Boolean = false,
     isAdbConnected: Boolean = false,
     onSendText: (text: String, replaceExisting: Boolean, submitWithEnter: Boolean) -> Unit,
+    onInsertChars: (String) -> Unit = { onSendText(it, false, false) },
+    onBackspace: (Int) -> Unit = { count -> repeat(count) { onSendKey(com.example.data.model.TvKeyCodes.DEL) } },
     onSendKey: (Int) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -100,18 +102,6 @@ fun KeyboardInputSheet(
                 selection = TextRange(initialText.length)
             )
             lastSyncedCommittedText = initialText
-        }
-    }
-
-    LaunchedEffect(fieldValue.text, liveSyncMode) {
-        if (liveSyncMode && fieldValue.text != lastSyncedCommittedText) {
-            if (fieldValue.composition != null) {
-                kotlinx.coroutines.delay(160)
-            }
-            if (fieldValue.text != lastSyncedCommittedText) {
-                lastSyncedCommittedText = fieldValue.text
-                onSendText(fieldValue.text, true, false)
-            }
         }
     }
 
@@ -175,7 +165,14 @@ fun KeyboardInputSheet(
                             if (liveSyncMode) MintGreen.copy(alpha = 0.6f) else CharcoalBorder,
                             CircleShape
                         )
-                        .clickable { liveSyncMode = !liveSyncMode }
+                        .clickable {
+                            val nextMode = !liveSyncMode
+                            liveSyncMode = nextMode
+                            if (nextMode && fieldValue.text != lastSyncedCommittedText) {
+                                lastSyncedCommittedText = fieldValue.text
+                                onSendText(fieldValue.text, true, false)
+                            }
+                        }
                         .testTag("keyboard_mode_live")
                 ) {
                     Box(
@@ -217,8 +214,32 @@ fun KeyboardInputSheet(
             OutlinedTextField(
                 value = fieldValue,
                 onValueChange = { next ->
+                    val previous = fieldValue.text
+                    val nextText = next.text
                     userEditedLocally = true
                     fieldValue = next
+                    if (liveSyncMode && nextText != previous) {
+                        when {
+                            nextText.length > previous.length && nextText.startsWith(previous) -> {
+                                onInsertChars(nextText.removePrefix(previous))
+                            }
+                            nextText.length < previous.length && previous.startsWith(nextText) -> {
+                                onBackspace(previous.length - nextText.length)
+                            }
+                            else -> {
+                                val commonPrefix = previous.commonPrefixWith(nextText).length
+                                val removedCount = (previous.length - commonPrefix).coerceAtLeast(0)
+                                if (removedCount > 0) {
+                                    onBackspace(removedCount)
+                                }
+                                val inserted = nextText.substring(commonPrefix)
+                                if (inserted.isNotEmpty()) {
+                                    onInsertChars(inserted)
+                                }
+                            }
+                        }
+                        lastSyncedCommittedText = nextText
+                    }
                 },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -271,9 +292,14 @@ fun KeyboardInputSheet(
                         .clip(CircleShape)
                         .border(1.dp, CharcoalBorder, CircleShape)
                         .clickable {
+                            val prevLen = fieldValue.text.length
                             fieldValue = TextFieldValue("")
                             lastSyncedCommittedText = ""
-                            onSendText("", true, false)
+                            if (liveSyncMode && prevLen > 0) {
+                                onBackspace(prevLen)
+                            } else {
+                                onSendText("", true, false)
+                            }
                         }
                         .testTag("keyboard_clear_button")
                 ) {

@@ -635,10 +635,53 @@ class RemoteViewModel(
         }
     }
 
+    fun sendKeyboardChars(text: String) {
+        if (text.isEmpty() || !ensureConnectedOrPrompt()) return
+        val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
+        viewModelScope.launch {
+            val imeActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
+            if (remoteClient.isConnected && imeActive) {
+                val res = runCatching { remoteClient.sendKeyboardChars(text) }
+                if (res.isSuccess) {
+                    lastAdbSentTextLength = 0
+                    return@launch
+                }
+            }
+            if (!adbClient.isConnected && !connectedHost.isNullOrBlank()) {
+                adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
+            }
+            if (!imeActive && adbClient.isConnected &&
+                (NetworkAdbClient.isAsciiInputSupported(text) || adbClient.hasAdbKeyboardIme())
+            ) {
+                val adbRes = adbClient.sendInputText(text = text, clearCount = 0, submitWithEnter = false)
+                if (adbRes.isSuccess) {
+                    lastAdbSentTextLength += text.length
+                    return@launch
+                }
+            }
+            runCatching { remoteClient.sendKeyboardChars(text) }
+                .onFailure { showMessage("텍스트 전송 실패: ${it.message}") }
+        }
+    }
+
+    fun sendKeyboardBackspace(count: Int = 1) {
+        if (count <= 0 || !ensureConnectedOrPrompt()) return
+        viewModelScope.launch {
+            val imeActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
+            if (!imeActive && adbClient.isConnected) {
+                repeat(count) { adbClient.sendKeyEvent(TvKeyCodes.DEL) }
+                lastAdbSentTextLength = (lastAdbSentTextLength - count).coerceAtLeast(0)
+                return@launch
+            }
+            runCatching { remoteClient.sendKeyboardBackspace(count) }
+                .onFailure { showMessage("삭제 전송 실패: ${it.message}") }
+        }
+    }
+
     /**
      * Standard Android TV Remote v2 keyboard transmission:
      * 1) When the TV has an active IME input field (RemoteImeShowRequest / RemoteImeKeyInject),
-     *    send all UTF-8 text (Korean Hangul, English, symbols) via RemoteImeBatchEdit + ENTER.
+     *    send UTF-8 text via RemoteImeKeyInject + RemoteImeBatchEdit(insert=1) + ENTER.
      * 2) When the TV app uses a custom keyboard without native Android IME focus (e.g. YouTube UI),
      *    fall back to ADB `input text` (ASCII) or ADBKeyboard broadcast (if installed).
      */

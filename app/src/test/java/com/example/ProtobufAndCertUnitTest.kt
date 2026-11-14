@@ -2,6 +2,7 @@ package com.example
 
 import com.example.data.model.TvAppCatalog
 import com.example.data.model.TvKeyCodes
+import com.example.network.AndroidTvRemoteClient
 import com.example.network.ProtobufWire
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -384,5 +385,153 @@ class ProtobufAndCertUnitTest {
         }
         assertEquals("", client.debugTrackedText)
         assertEquals(0, client.debugImeCounter)
+        assertEquals(524289, client.debugSyncedTextInt5)
+    }
+
+    @Test
+    fun `ime sync parses app_package from field 12 and resets active IME when app switches`() {
+        var hiddenCalls = 0
+        val changedPkgs = mutableListOf<String>()
+        val client = com.example.network.AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = { changedPkgs.add(it) },
+            onImeShowRequested = { _, _ -> },
+            onImeHidden = { hiddenCalls++ },
+            onVolumeChanged = { _, _, _ -> },
+            onDisconnected = {}
+        )
+
+        val showInLauncher = ProtobufWire.encode {
+            writeMessageField(20) {
+                writeMessageField(1) {
+                    writeVarintField(3, 1)
+                    writeStringField(10, "Android TV Home")
+                    writeStringField(12, "com.google.android.tvlauncher")
+                }
+            }
+            writeMessageField(22) {
+                writeMessageField(2) {
+                    writeVarintField(1, 0) // Shield-style fieldCounter = 0
+                    writeVarintField(5, 1)
+                    writeStringField(6, "Search")
+                }
+            }
+        }
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(showInLauncher))
+        }
+        assertEquals("com.google.android.tvlauncher", client.debugForegroundPackage)
+        assertTrue(client.isImeFieldActive)
+        assertEquals(0, client.resolvedImeFieldCounter())
+        assertEquals("Search", client.debugSyncedTextLabel)
+
+        val switchToYoutube = ProtobufWire.encode {
+            writeMessageField(20) {
+                writeMessageField(1) {
+                    writeStringField(12, "com.google.android.youtube.tv")
+                }
+            }
+        }
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(switchToYoutube))
+        }
+        assertEquals("com.google.android.youtube.tv", client.debugForegroundPackage)
+        assertEquals(false, client.isImeFieldActive)
+        assertEquals(1, hiddenCalls)
+        assertEquals(listOf("com.google.android.tvlauncher", "com.google.android.youtube.tv"), changedPkgs)
+    }
+
+    @Test
+    fun `sendText and sendKeyboardChars emit dual RemoteImeKeyInject and insert-1 RemoteImeBatchEdit`() {
+        val sentChunks = mutableListOf<ByteArray>()
+        val client = com.example.network.AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = {},
+            onImeShowRequested = { _, _ -> },
+            onVolumeChanged = { _, _, _ -> },
+            onDisconnected = {}
+        ).apply {
+            testRawBytesSink = { bytes -> sentChunks.add(bytes) }
+        }
+
+        val initShow = ProtobufWire.encode {
+            writeMessageField(20) {
+                writeMessageField(1) {
+                    writeStringField(12, "com.android.vending")
+                }
+            }
+            writeMessageField(22) {
+                writeMessageField(2) {
+                    writeVarintField(1, 4)
+                    writeVarintField(5, 524289)
+                    writeStringField(6, "Search Google Play")
+                }
+            }
+        }
+        val batchAck = ProtobufWire.encode {
+            writeMessageField(21) {
+                writeVarintField(1, 2) // syncedImeCounter = 2
+                writeVarintField(2, 4) // syncedFieldCounter = 4
+            }
+        }
+
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(initShow))
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(batchAck))
+            client.sendText("오징어", replaceExisting = true, submitWithEnter = false)
+        }
+
+        assertEquals(1, sentChunks.size)
+        val input = ByteArrayInputStream(sentChunks.first())
+        val frame1 = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(input))
+        val frame2 = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(input))
+
+        val keyInject = frame1.first { it.number == 20 }.asMessage()
+        val appInfo = keyInject.first { it.number == 1 }.asMessage()
+        assertEquals("com.android.vending", appInfo.first { it.number == 12 }.asString())
+        val status = keyInject.first { it.number == 2 }.asMessage()
+        assertEquals(4L, status.first { it.number == 1 }.varint)
+        assertEquals("오징어", status.first { it.number == 2 }.asString())
+        assertEquals(3L, status.first { it.number == 3 }.varint)
+        assertEquals(3L, status.first { it.number == 4 }.varint)
+        assertEquals(524289L, status.first { it.number == 5 }.varint)
+        assertEquals("Search Google Play", status.first { it.number == 6 }.asString())
+
+        val batchEdit = frame2.first { it.number == 21 }.asMessage()
+        assertEquals(2L, batchEdit.first { it.number == 1 }.varint)
+        assertEquals(4L, batchEdit.first { it.number == 2 }.varint)
+        val editInfo = batchEdit.first { it.number == 3 }.asMessage()
+        assertEquals(1L, editInfo.first { it.number == 1 }.varint)
+        val imeObj = editInfo.first { it.number == 2 }.asMessage()
+        assertEquals(3L, imeObj.first { it.number == 1 }.varint)
+        assertEquals(3L, imeObj.first { it.number == 2 }.varint)
+        assertEquals("오징어", imeObj.first { it.number == 3 }.asString())
+
+        sentChunks.clear()
+        kotlinx.coroutines.runBlocking {
+            client.sendKeyboardChars("가나")
+            client.sendKeyboardBackspace(1)
+            client.applyIncomingFieldsForTest(
+                ProtobufWire.parseFields(
+                    ProtobufWire.encode {
+                        writeMessageField(2) {
+                            writeVarintField(1, 639)
+                        }
+                    }
+                )
+            )
+        }
+        // "가" (dual frame), "나" (dual frame), DEL key, RemoteSetActive reply
+        assertEquals(4, sentChunks.size)
+        val delFrame = ProtobufWire.parseFields(
+            ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[2]))
+        ).first { it.number == 10 }.asMessage()
+        assertEquals(com.example.data.model.TvKeyCodes.DEL.toLong(), delFrame.first { it.number == 1 }.varint)
+        assertEquals(AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), delFrame.first { it.number == 2 }.varint)
+
+        val activeFrame = ProtobufWire.parseFields(
+            ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[3]))
+        ).first { it.number == 2 }.asMessage()
+        assertEquals(AndroidTvRemoteClient.REMOTE_FEATURES.toLong(), activeFrame.first { it.number == 1 }.varint)
     }
 }

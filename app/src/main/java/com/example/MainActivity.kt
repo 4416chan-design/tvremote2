@@ -298,6 +298,8 @@ class MainActivity : ComponentActivity() {
                         isTvImeVisible = imePromptState.isTvImeVisible,
                         isAdbConnected = adbState == com.example.network.AdbConnectionState.CONNECTED,
                         onSendText = viewModel::sendKeyboardText,
+                        onInsertChars = viewModel::sendKeyboardChars,
+                        onBackspace = viewModel::sendKeyboardBackspace,
                         onSendKey = viewModel::sendKey,
                         onDismiss = viewModel::dismissKeyboardSheet
                     )
