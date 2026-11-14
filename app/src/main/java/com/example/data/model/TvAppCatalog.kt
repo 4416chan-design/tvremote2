@@ -35,6 +35,7 @@ object TvKeyCodes {
     const val VOICE_ASSIST = 231
     const val ALL_APPS = 284
     const val SLEEP = 223
+    const val SPACE = 62
     const val DEL = 67
     const val ENTER = 66
 }

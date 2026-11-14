@@ -48,19 +48,16 @@ class AndroidTvRemoteClient(
     private var fieldCounter: Int = 0
 
     @Volatile
-    private var syncedImeCounter: Int = -1
+    private var hasKeyInjectImeCounter: Boolean = false
 
     @Volatile
-    private var syncedFieldCounter: Int = -1
+    private var hasKeyInjectFieldCounter: Boolean = false
 
     @Volatile
     private var syncedTextInt5: Int = -1
 
     @Volatile
     private var syncedTextLabel: String = ""
-
-    @Volatile
-    private var syncedAppInfoBytes: ByteArray? = null
 
     @Volatile
     private var trackedTvText: String = ""
@@ -91,11 +88,11 @@ class AndroidTvRemoteClient(
     internal val debugFieldCounter: Int
         get() = fieldCounter
 
-    internal val debugSyncedImeCounter: Int
-        get() = syncedImeCounter
+    internal val debugHasKeyInjectImeCounter: Boolean
+        get() = hasKeyInjectImeCounter
 
-    internal val debugSyncedFieldCounter: Int
-        get() = syncedFieldCounter
+    internal val debugHasKeyInjectFieldCounter: Boolean
+        get() = hasKeyInjectFieldCounter
 
     internal val debugSyncedTextInt5: Int
         get() = syncedTextInt5
@@ -218,14 +215,16 @@ class AndroidTvRemoteClient(
                     }
                     sendRaw(pong)
                 }
-                20 -> { // remote_ime_key_inject (reports active app & IME status)
+                20 -> { // remote_ime_key_inject (reports active app, app_info.counter & IME status)
                     val imeFields = field.asMessage()
-                    val appInfoField = imeFields.firstOrNull { it.number == 1 && it.wireType == 2 }
-                    if (appInfoField != null) {
-                        syncedAppInfoBytes = appInfoField.bytes
+                    val appInfo = imeFields.firstOrNull { it.number == 1 && it.wireType == 2 }?.asMessage()
+                    if (appInfo != null) {
+                        val incomingImeCounter = appInfo.firstOrNull { it.number == 1 && it.wireType == 0 }?.varint?.toInt() ?: 0
+                        imeCounter = incomingImeCounter
+                        hasKeyInjectImeCounter = incomingImeCounter != 0
                     }
+
                     // RemoteAppInfo.app_package is field 12 (string); field 3 is int3 (varint)
-                    val appInfo = appInfoField?.asMessage()
                     val pkg = appInfo?.firstOrNull { it.number == 12 && it.wireType == 2 }?.asString()
                     if (!pkg.isNullOrBlank()) {
                         val previousPkg = currentForegroundPackage
@@ -243,9 +242,15 @@ class AndroidTvRemoteClient(
                         val prevFieldCounter = fieldCounter
                         syncImeTextStatus(textStatus, isShowRequest = false)
                         notifyImeActivationIfNeeded(wasActive, prevFieldCounter)
+                    } else {
+                        fieldCounter = 0
+                        hasKeyInjectFieldCounter = false
+                        trackedTvText = ""
+                        trackedSelStart = 0
+                        trackedSelEnd = 0
                     }
                 }
-                21 -> { // remote_ime_batch_edit (TV echoes/acknowledges updated ime_counter & field_counter)
+                21 -> { // remote_ime_batch_edit (fallback counters only when key_inject/show_request has none)
                     val batchFields = field.asMessage()
                     val wasActive = isImeFieldActive
                     val prevFieldCounter = fieldCounter
@@ -263,8 +268,8 @@ class AndroidTvRemoteClient(
                     if (textStatus != null) {
                         syncImeTextStatus(textStatus, isShowRequest = true)
                     } else {
-                        imeCounter = 0
-                        syncedImeCounter = -1
+                        fieldCounter = 0
+                        hasKeyInjectFieldCounter = true
                         trackedTvText = ""
                         trackedSelStart = 0
                         trackedSelEnd = 0
@@ -291,6 +296,10 @@ class AndroidTvRemoteClient(
         handleIncomingFields(fields)
     }
 
+    internal fun setConnectedForTest(connected: Boolean) {
+        isConnected = connected
+    }
+
     /**
      * Some TVs/apps signal text-field focus only via RemoteImeKeyInject(20) or RemoteImeBatchEdit(21)
      * instead of RemoteImeShowRequest(22). Surface those activations to the UI as well.
@@ -305,11 +314,10 @@ class AndroidTvRemoteClient(
     private fun resetImeState() {
         imeCounter = 0
         fieldCounter = 0
-        syncedImeCounter = -1
-        syncedFieldCounter = -1
+        hasKeyInjectImeCounter = false
+        hasKeyInjectFieldCounter = false
         syncedTextInt5 = -1
         syncedTextLabel = ""
-        syncedAppInfoBytes = null
         trackedTvText = ""
         trackedSelStart = 0
         trackedSelEnd = 0
@@ -318,21 +326,19 @@ class AndroidTvRemoteClient(
         currentForegroundPackage = null
     }
 
-    internal fun resolvedImeFieldCounter(): Int = when {
-        syncedFieldCounter >= 0 -> syncedFieldCounter
-        fieldCounter > 0 -> fieldCounter
-        else -> 1
-    }
+    internal fun resolvedImeFieldCounter(): Int = fieldCounter
 
     private fun syncIncomingImeBatchEdit(batchFields: List<ProtobufWire.Field>) {
         val tvImeCounter = batchFields.firstOrNull { it.number == 1 }?.varint?.toInt() ?: 0
         val tvFieldCounter = batchFields.firstOrNull { it.number == 2 }?.varint?.toInt() ?: 0
-        syncedImeCounter = tvImeCounter
-        syncedFieldCounter = tvFieldCounter
-        imeCounter = tvImeCounter
-        fieldCounter = tvFieldCounter
-        if (tvFieldCounter > 0) {
-            isImeFieldActive = true
+        if (!hasKeyInjectImeCounter) {
+            imeCounter = tvImeCounter
+        }
+        if (!hasKeyInjectFieldCounter) {
+            fieldCounter = tvFieldCounter
+            if (tvFieldCounter > 0) {
+                isImeFieldActive = true
+            }
         }
         val edits = batchFields.filter { it.number == 3 }
         for (editField in edits) {
@@ -355,9 +361,9 @@ class AndroidTvRemoteClient(
         val incomingLabel = textStatus.firstOrNull { it.number == 6 }?.asString()
         // NOTE: RemoteTextFieldStatus field 5 (int5) is TV EditorInfo attribute/inputType flags, NOT ime_counter!
 
-        // Accept fieldCounter = 0 (NVIDIA Shield sends 0 for all fields)
-        syncedFieldCounter = incomingFc
+        // Accept fieldCounter = 0 (NVIDIA Shield & YouTube use 0)
         fieldCounter = incomingFc
+        hasKeyInjectFieldCounter = isShowRequest || incomingFc != 0
         if (incomingInt5 != null) {
             syncedTextInt5 = incomingInt5
         }
@@ -374,11 +380,6 @@ class AndroidTvRemoteClient(
         val selEnd = (incomingEnd ?: selStart).coerceIn(selStart, safeLen)
         trackedSelStart = selStart
         trackedSelEnd = selEnd
-
-        if (isShowRequest) {
-            imeCounter = 0
-            syncedImeCounter = -1
-        }
     }
 
     suspend fun sendKey(keyCode: Int, direction: Int = DIRECTION_SHORT) {
@@ -420,64 +421,69 @@ class AndroidTvRemoteClient(
     }
 
     /**
-     * Ported from harimoradiya/androidtvremote RemoteSession.sendText:
-     * sends RemoteImeKeyInject (part1) + RemoteImeBatchEdit with insert=1 (part2) in a single flush.
+     * Sends a single RemoteImeBatchEdit(21) frame using the TV-authoritative imeCounter & fieldCounter.
+     * Client must never transmit RemoteImeKeyInject(20) (TV -> remote only) or bump imeCounter locally.
      */
-    private suspend fun sendImeSyncPacketLocked(text: String, imeCounterCandidate: Int) {
-        val resolvedIme = if (syncedImeCounter >= 0) syncedImeCounter else imeCounterCandidate.coerceAtLeast(0)
-        val resolvedField = resolvedImeFieldCounter()
-
-        val part1 = buildImeTextPayload(
-            text = text,
-            fieldCounter = resolvedField,
-            int5 = syncedTextInt5,
-            label = syncedTextLabel,
-            appInfoBytes = syncedAppInfoBytes
-        )
-        val part2 = buildImeBatchEditPayload(
-            imeCounter = resolvedIme,
-            fieldCounter = resolvedField,
+    private suspend fun sendBatchEditLocked(text: String) {
+        val payload = buildImeBatchEditPayload(
+            imeCounter = imeCounter,
+            fieldCounter = resolvedImeFieldCounter(),
             text = text,
             start = text.length,
             end = text.length,
             insert = 1
         )
-
-        val combined = ProtobufWire.frameMessage(part1) + ProtobufWire.frameMessage(part2)
-        sendFramedBytes(combined)
-        syncedImeCounter = resolvedIme
-        syncedFieldCounter = resolvedField
+        sendRaw(payload)
     }
 
     suspend fun sendText(text: String, replaceExisting: Boolean = false, submitWithEnter: Boolean = false) {
         imeMutex.withLock {
-            val currentCounter = ++imeCounter
-            sendImeSyncPacketLocked(text = text, imeCounterCandidate = currentCounter)
-            trackedTvText = text
-            trackedSelStart = text.length
-            trackedSelEnd = text.length
+            if (text.isNotEmpty() || !submitWithEnter) {
+                sendBatchEditLocked(text)
+                trackedTvText = text
+                trackedSelStart = text.length
+                trackedSelEnd = text.length
+            }
 
             if (submitWithEnter) {
-                kotlinx.coroutines.delay(150)
+                if (text.isNotEmpty()) {
+                    kotlinx.coroutines.delay(150)
+                }
                 sendKey(TvKeyCodes.ENTER, DIRECTION_SHORT)
             }
         }
     }
 
     /**
-     * Ported from harimoradiya/androidtvremote TvRemoteViewModel.sendKeyboardText:
-     * transmits each inserted character with synced fieldCounter & incrementing imeCounter.
+     * Transmits inserted characters/text live via RemoteImeBatchEdit(21),
+     * sending spaces as physical KEYCODE_SPACE (62) key events matching TV remote apps.
      */
     suspend fun sendKeyboardChars(text: String) {
         if (text.isEmpty()) return
         imeMutex.withLock {
-            for (ch in text) {
-                val currentCounter = imeCounter++
-                sendImeSyncPacketLocked(text = ch.toString(), imeCounterCandidate = currentCounter)
-                trackedTvText += ch
-                trackedSelStart = trackedTvText.length
-                trackedSelEnd = trackedTvText.length
+            val nonSpaceChunk = StringBuilder()
+            suspend fun flushChunk() {
+                if (nonSpaceChunk.isNotEmpty()) {
+                    val chunk = nonSpaceChunk.toString()
+                    nonSpaceChunk.clear()
+                    sendBatchEditLocked(chunk)
+                    trackedTvText += chunk
+                    trackedSelStart = trackedTvText.length
+                    trackedSelEnd = trackedTvText.length
+                }
             }
+            for (ch in text) {
+                if (ch == ' ') {
+                    flushChunk()
+                    sendKey(TvKeyCodes.SPACE, DIRECTION_SHORT)
+                    trackedTvText += ' '
+                    trackedSelStart = trackedTvText.length
+                    trackedSelEnd = trackedTvText.length
+                } else {
+                    nonSpaceChunk.append(ch)
+                }
+            }
+            flushChunk()
         }
     }
 
@@ -564,44 +570,11 @@ class AndroidTvRemoteClient(
             }
         }
 
-        fun buildImeTextPayload(
-            text: String,
-            fieldCounter: Int,
-            int5: Int = -1,
-            label: String = "",
-            appInfoBytes: ByteArray? = null
-        ): ByteArray = ProtobufWire.encode {
-            val cursor = text.length
-            writeMessageField(20) { // remote_ime_key_inject
-                if (appInfoBytes != null && appInfoBytes.isNotEmpty()) {
-                    writeBytesField(1, appInfoBytes) // app_info
-                }
-                writeMessageField(2) { // text_field_status (RemoteTextFieldStatus)
-                    if (fieldCounter != 0) {
-                        writeVarintField(1, fieldCounter)
-                    }
-                    if (text.isNotEmpty()) {
-                        writeStringField(2, text)
-                    }
-                    if (cursor != 0) {
-                        writeVarintField(3, cursor)
-                        writeVarintField(4, cursor)
-                    }
-                    if (int5 >= 0) {
-                        writeVarintField(5, int5)
-                    }
-                    if (label.isNotEmpty()) {
-                        writeStringField(6, label)
-                    }
-                }
-            }
-        }
-
         fun buildImeBatchEditPayload(
             imeCounter: Int,
             fieldCounter: Int,
             text: String,
-            cursor: Int = (text.length - 1).coerceAtLeast(0),
+            cursor: Int = text.length,
             start: Int = cursor,
             end: Int = cursor,
             insert: Int = 1

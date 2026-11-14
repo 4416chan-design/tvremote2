@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Backspace
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Keyboard
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -63,6 +64,7 @@ import com.example.ui.theme.MintGreenContainer
 import com.example.ui.theme.OnMintGreen
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.WarningAmber
 
 /**
  * Reference-matched Korean + English keyboard input sheet for Android TV IME input.
@@ -74,6 +76,8 @@ fun KeyboardInputSheet(
     initialText: String,
     isTvImeVisible: Boolean = false,
     isAdbConnected: Boolean = false,
+    isAdbKeyboardInstalled: Boolean? = null,
+    onOpenAdbKeyboardSetup: () -> Unit = {},
     onSendText: (text: String, replaceExisting: Boolean, submitWithEnter: Boolean) -> Unit,
     onSendKey: (Int) -> Unit,
     onInsertChars: (String) -> Unit = { onSendText(it, false, false) },
@@ -105,10 +109,6 @@ fun KeyboardInputSheet(
         }
     }
 
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-    }
-
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -117,6 +117,11 @@ fun KeyboardInputSheet(
         containerColor = CharcoalBg,
         contentColor = TextPrimary
     ) {
+        LaunchedEffect(focusRequester) {
+            kotlinx.coroutines.yield()
+            runCatching { focusRequester.requestFocus() }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -141,16 +146,22 @@ fun KeyboardInputSheet(
                         style = MaterialTheme.typography.titleLarge,
                         color = TextPrimary
                     )
-                    val statusText = when {
-                        isTvImeVisible && isAdbConnected -> "TV 입력창 · ADB 연결됨 (한글/영문 지원)"
-                        isTvImeVisible -> "TV 입력창 연결됨 (한글/영문 지원)"
-                        isAdbConnected -> "ADB 연결됨 (TV 입력창 미열림 · 영문 직접 전송)"
-                        else -> "TV에서 검색창을 먼저 선택하세요"
+                    val (statusText, statusColor) = when {
+                        isAdbConnected && isAdbKeyboardInstalled == true ->
+                            "ADBKeyBoard 연결됨 · 한글/전체 전송 지원" to MintGreen
+                        isAdbConnected && isAdbKeyboardInstalled == false ->
+                            "ADBKeyBoard 미설치 · Download APK 설치 필요" to WarningAmber
+                        isTvImeVisible ->
+                            "TV 입력창 연결됨 (한글/영문 지원)" to MintGreen
+                        else ->
+                            "TV 검색창/키보드를 연 상태에서 입력 후 전송하세요" to (
+                                if (isAdbConnected) MintGreen else TextSecondary
+                                )
                     }
                     Text(
                         text = statusText,
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (isAdbConnected || isTvImeVisible) MintGreen else TextSecondary
+                        color = statusColor
                     )
                 }
 
@@ -209,7 +220,52 @@ fun KeyboardInputSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            if (isAdbKeyboardInstalled == false) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    color = CharcoalSurface,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .border(1.dp, WarningAmber.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+                        .clickable(onClick = onOpenAdbKeyboardSetup)
+                        .testTag("adb_keyboard_setup_banner")
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Download,
+                            contentDescription = null,
+                            tint = WarningAmber,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "ADBKeyBoard 미설치 · Download APK 설치 안내 열기",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = WarningAmber,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            fun submitCurrentText() {
+                fieldValue = fieldValue.copy(composition = null)
+                val textToSend = fieldValue.text
+                val isPureAscii = textToSend.all { it.code in 0x20..0x7E }
+                if (liveSyncMode && textToSend == lastSyncedCommittedText && textToSend.isNotEmpty() && isPureAscii) {
+                    onSendKey(com.example.data.model.TvKeyCodes.ENTER)
+                } else {
+                    lastSyncedCommittedText = textToSend
+                    onSendText(textToSend, true, true)
+                }
+            }
 
             OutlinedTextField(
                 value = fieldValue,
@@ -268,11 +324,7 @@ fun KeyboardInputSheet(
                     imeAction = ImeAction.Send
                 ),
                 keyboardActions = KeyboardActions(
-                    onSend = {
-                        fieldValue = fieldValue.copy(composition = null)
-                        lastSyncedCommittedText = fieldValue.text
-                        onSendText(fieldValue.text, true, true)
-                    }
+                    onSend = { submitCurrentText() }
                 )
             )
 
@@ -295,7 +347,7 @@ fun KeyboardInputSheet(
                             val prevLen = fieldValue.text.length
                             fieldValue = TextFieldValue("")
                             lastSyncedCommittedText = ""
-                            if (liveSyncMode && prevLen > 0) {
+                            if (liveSyncMode && prevLen > 0 && isAdbKeyboardInstalled != true) {
                                 onBackspace(prevLen)
                             } else {
                                 onSendText("", true, false)
@@ -324,11 +376,7 @@ fun KeyboardInputSheet(
 
                 val hasText = fieldValue.text.isNotEmpty()
                 Button(
-                    onClick = {
-                        fieldValue = fieldValue.copy(composition = null)
-                        lastSyncedCommittedText = fieldValue.text
-                        onSendText(fieldValue.text, true, true)
-                    },
+                    onClick = { submitCurrentText() },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (hasText) MintGreen else CharcoalSurfaceElevated,
                         contentColor = if (hasText) OnMintGreen else TextPrimary

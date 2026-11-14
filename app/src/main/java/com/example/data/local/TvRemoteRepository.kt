@@ -166,13 +166,24 @@ class TvRemoteRepository(private val db: AppDatabase) {
         db.customButtonDao().upsert(button)
     }
 
+    suspend fun getPreferencesOnce(): AppPreferencesEntity =
+        db.appPreferencesDao().getPreferencesOnce() ?: AppPreferencesEntity()
+
+    suspend fun markAdbKeyboardPrompted() {
+        val current = getPreferencesOnce()
+        if (!current.hasPromptedAdbKeyboardSetup) {
+            db.appPreferencesDao().upsert(current.copy(hasPromptedAdbKeyboardSetup = true))
+        }
+    }
+
     suspend fun updatePreferences(
         hapticEnabled: Boolean,
         autoShowKeyboard: Boolean,
         brightnessPercent: Int
     ) {
+        val current = getPreferencesOnce()
         db.appPreferencesDao().upsert(
-            AppPreferencesEntity(
+            current.copy(
                 id = 1,
                 hapticEnabled = hapticEnabled,
                 autoShowKeyboard = autoShowKeyboard,

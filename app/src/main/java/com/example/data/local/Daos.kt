@@ -86,6 +86,9 @@ interface AppPreferencesDao {
     @Query("SELECT * FROM app_preferences WHERE id = 1")
     fun observePreferences(): Flow<AppPreferencesEntity?>
 
+    @Query("SELECT * FROM app_preferences WHERE id = 1")
+    suspend fun getPreferencesOnce(): AppPreferencesEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(prefs: AppPreferencesEntity)
 }
