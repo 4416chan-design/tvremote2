@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -647,7 +648,7 @@ class RemoteViewModel(
         replaceExisting: Boolean,
         submitWithEnter: Boolean,
         showSuccessMessage: Boolean
-    ) {
+    ): Boolean {
         val imeActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
         if (remoteClient.isConnected && imeActive) {
             val imeResult = runCatching {
@@ -662,7 +663,7 @@ class RemoteViewModel(
                 if (showSuccessMessage) {
                     showMessage("TV로 입력을 전송했습니다.")
                 }
-                return
+                return true
             }
         }
 
@@ -698,7 +699,7 @@ class RemoteViewModel(
                     if (showSuccessMessage) {
                         showMessage("ADB로 입력을 전송했습니다.")
                     }
-                    return
+                    return true
                 }
             }
         }
@@ -711,14 +712,19 @@ class RemoteViewModel(
                 submitWithEnter = submitWithEnter
             )
         }
-        if (fallbackResult.isSuccess) {
+        return if (fallbackResult.isSuccess) {
             if (!imeActive && !NetworkAdbClient.isAsciiInputSupported(text) && text.isNotEmpty()) {
                 showMessage("TV 검색창(키보드)이 열려 있는지 확인해 주세요. (자체 키보드 앱은 영문 ADB 입력 지원)")
-            } else if (showSuccessMessage) {
-                showMessage("TV로 입력을 전송했습니다.")
+                false
+            } else {
+                if (showSuccessMessage) {
+                    showMessage("TV로 입력을 전송했습니다.")
+                }
+                true
             }
         } else {
             showMessage("텍스트 전송 실패: ${fallbackResult.exceptionOrNull()?.message}")
+            false
         }
     }
 
@@ -779,7 +785,8 @@ class RemoteViewModel(
                 if (sessionId == null) {
                     // TV did not open a Protocol v2 RemoteVoiceBegin stream; release mic & fall back to SpeechRecognizer
                     voiceBeginDeferred = null
-                    voiceStreamer.stop()
+                    // Wait for AudioRecord release before SpeechRecognizer opens the mic
+                    voiceStreamer.stopAndJoin()
                     _isVoiceListening.value = false
                     if (remoteClient.isConnected) {
                         voiceFallbackChannel.trySend(Unit)
@@ -829,20 +836,36 @@ class RemoteViewModel(
         val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
         viewModelScope.launch {
             runCatching {
-                remoteClient.sendKey(TvKeyCodes.SEARCH, AndroidTvRemoteClient.DIRECTION_SHORT)
-                delay(350)
-                sendTextViaStandardImeOrAdb(
+                val imeAlreadyActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
+                if (!imeAlreadyActive) {
+                    // Open TV search and wait until the TV actually reports a focused text field
+                    // (fixed 350 ms delay was too short, so text was sent before the field existed).
+                    remoteClient.sendKey(TvKeyCodes.SEARCH, AndroidTvRemoteClient.DIRECTION_SHORT)
+                    awaitTvImeField(VOICE_IME_WAIT_MS)
+                }
+                val sent = sendTextViaStandardImeOrAdb(
                     host = connectedHost,
                     text = spokenText,
                     replaceExisting = true,
                     submitWithEnter = true,
                     showSuccessMessage = false
                 )
-                showMessage("\"$spokenText\" 음성 검색 전송")
+                if (sent) {
+                    showMessage("\"$spokenText\" 음성 검색 전송")
+                }
             }.onFailure {
                 showMessage("음성 검색 전송 실패: ${it.message}")
             }
         }
+    }
+
+    private suspend fun awaitTvImeField(timeoutMs: Long): Boolean =
+        withTimeoutOrNull(timeoutMs) {
+            _imePromptState.first { it.isTvImeVisible }
+        } != null
+
+    private companion object {
+        const val VOICE_IME_WAIT_MS = 3_000L
     }
 
     fun toggleFavorite(app: TvAppCatalogItem, isCurrentlyFavorite: Boolean) {

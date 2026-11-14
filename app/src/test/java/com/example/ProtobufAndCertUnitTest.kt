@@ -147,27 +147,101 @@ class ProtobufAndCertUnitTest {
     }
 
     @Test
-    fun `ime batch edit payload uses insert zero and preserves counters and range`() {
+    fun `ime batch edit payload uses insert one full text and cursor at len minus one`() {
         val payload = com.example.network.AndroidTvRemoteClient.buildImeBatchEditPayload(
-            imeCounter = 0,
+            imeCounter = 5,
             fieldCounter = 3,
-            start = 0,
-            end = 4,
-            text = "유튜브 검색",
-            insert = 0
+            text = "유튜브 검색"
         )
         val root = ProtobufWire.parseFields(payload)
         val batchEdit = root.first { it.number == 21 }.asMessage()
-        assertEquals(0L, batchEdit.first { it.number == 1 }.varint)
+        assertEquals(5L, batchEdit.first { it.number == 1 }.varint)
         assertEquals(3L, batchEdit.first { it.number == 2 }.varint)
 
         val editInfo = batchEdit.first { it.number == 3 }.asMessage()
-        assertEquals(0L, editInfo.first { it.number == 1 }.varint)
+        assertEquals(1L, editInfo.first { it.number == 1 }.varint)
 
         val imeObj = editInfo.first { it.number == 2 }.asMessage()
-        assertEquals(0L, imeObj.first { it.number == 1 }.varint)
-        assertEquals(4L, imeObj.first { it.number == 2 }.varint)
+        assertEquals(5L, imeObj.first { it.number == 1 }.varint)
+        assertEquals(5L, imeObj.first { it.number == 2 }.varint)
         assertEquals("유튜브 검색", imeObj.first { it.number == 3 }.asString())
+    }
+
+    @Test
+    fun `ime focus via key inject notifies ui and parses app_package field 12`() {
+        var imeShowCalls = 0
+        var hiddenCalls = 0
+        var lastPkg = ""
+        val client = com.example.network.AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = { lastPkg = it },
+            onImeShowRequested = { _, _ -> imeShowCalls++ },
+            onImeHidden = { hiddenCalls++ },
+            onVolumeChanged = { _, _, _ -> },
+            onDisconnected = {}
+        )
+
+        fun keyInject(pkg: String, fc: Int?) = ProtobufWire.encode {
+            writeMessageField(20) {
+                writeMessageField(1) {
+                    writeVarintField(1, 1)
+                    writeVarintField(3, 7)
+                    writeStringField(12, pkg)
+                }
+                if (fc != null) {
+                    writeMessageField(2) {
+                        writeVarintField(1, fc)
+                        writeStringField(2, "abc")
+                    }
+                }
+            }
+        }
+
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(keyInject("com.google.android.youtube.tv", 4)))
+        }
+        assertEquals("com.google.android.youtube.tv", lastPkg)
+        assertEquals(1, imeShowCalls)
+        assertTrue(client.isImeFieldActive)
+        assertEquals(4, client.debugFieldCounter)
+
+        // Same field again: no duplicate UI notification
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(keyInject("com.google.android.youtube.tv", 4)))
+        }
+        assertEquals(1, imeShowCalls)
+
+        // Switching to another app hides the stale IME field
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(keyInject("com.netflix.ninja", null)))
+        }
+        assertEquals(1, hiddenCalls)
+        assertEquals(false, client.isImeFieldActive)
+    }
+
+    @Test
+    fun `ime batch edit from tv activates field and adopts tv ime counter`() {
+        var imeShowCalls = 0
+        val client = com.example.network.AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = {},
+            onImeShowRequested = { _, _ -> imeShowCalls++ },
+            onVolumeChanged = { _, _, _ -> },
+            onDisconnected = {}
+        )
+        val batch = ProtobufWire.encode {
+            writeMessageField(21) {
+                writeVarintField(1, 9)
+                writeVarintField(2, 2)
+            }
+        }
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(batch))
+        }
+        assertEquals(1, imeShowCalls)
+        assertTrue(client.isImeFieldActive)
+        assertEquals(9, client.debugImeCounter)
+        assertEquals(2, client.debugFieldCounter)
     }
 
     @Test

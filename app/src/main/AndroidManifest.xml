@@ -12,6 +12,13 @@
         android:name="android.hardware.microphone"
         android:required="false" />
 
+    <!-- Android 11+ package visibility: required for SpeechRecognizer.isRecognitionAvailable() -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <application
         android:name=".TvRemoteApplication"
         android:allowBackup="true"

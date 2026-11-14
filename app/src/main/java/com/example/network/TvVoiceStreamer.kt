@@ -110,6 +110,16 @@ class TvVoiceStreamer {
         preBuffer.clear()
     }
 
+    /**
+     * Stops capture and waits until AudioRecord is actually released, so another recorder
+     * (e.g. SpeechRecognizer fallback) can open the microphone without ERROR_AUDIO / BUSY.
+     */
+    suspend fun stopAndJoin() {
+        val job = captureJob
+        stop()
+        job?.join()
+    }
+
     @SuppressLint("MissingPermission")
     private fun createAudioRecord(bufferSize: Int): AudioRecord {
         val voiceRec = runCatching {
