@@ -46,23 +46,32 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLException
 import javax.net.ssl.SSLSocket
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+
 /**
- * Manages Android TV Remote Protocol v2 Push-to-Talk voice streaming using generated
+ * Manages Android TV Remote Protocol v2 voice streaming using generated
  * `protobuf-javalite` messages (`com.example.proto.RemoteMessage`) and Varint32
  * length-prefixed framing over TLS port 6466 (with pairing on port 6467).
  *
- * Strictly executes the 5-step handshake:
- * 1. `ACTION_DOWN` -> sends `RemoteKeyInject(KEYCODE_SEARCH = 84, SHORT)`.
+ * Supports Tap-to-Talk with pre-capture buffering and tail capture delay while strictly preserving
+ * the Protocol v2 wire handshake:
+ * 1. Sends `RemoteKeyInject(KEYCODE_SEARCH = 84, SHORT)` and immediately pre-captures PCM (8 kHz, Mono, 16-bit).
  * 2. Waits for TV's `RemoteVoiceBegin` and parses `session_id` (never uses arbitrary or `-1` IDs).
  * 3. Replies `RemoteVoiceBegin(session_id, RemoteVoiceConfig(sample_rate = 8000, channel_config = 1, audio_format = 2))`.
- * 4. Starts `AudioRecord` (8000 Hz, Mono, PCM 16-bit) and streams `RemoteVoicePayload(session_id, samples)`.
- * 5. `ACTION_UP` -> stops recording, flushes remaining PCM, and sends `RemoteVoiceEnd(session_id)`.
+ * 4. Flushes pre-captured PCM and continues streaming `RemoteVoicePayload(session_id, samples)`.
+ * 5. On stop (2nd tap / 3s silence / max duration), waits `tailDelayMs`, stops `AudioRecord`,
+ *    flushes remaining PCM, and sends `RemoteVoiceEnd(session_id)`.
  */
 class TvVoiceManager(
     transport: RemoteMessageTransport? = null,
     private val pcmRecorder: VoicePcmRecorder = HardwareAudioRecordRecorder(),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val voiceBeginTimeoutMs: Long = DEFAULT_VOICE_BEGIN_TIMEOUT_MS,
+    private val preCaptureBeforeVoiceBegin: Boolean = true,
+    private val tailDelayMs: Long = DEFAULT_TAIL_DELAY_MS,
+    private val noActivityTimeoutMs: Long? = DEFAULT_NO_ACTIVITY_TIMEOUT_MS,
+    private val maxStreamDurationMs: Long? = DEFAULT_MAX_STREAM_DURATION_MS,
     private val coalesceChunksTo8Kb20Kb: Boolean = true,
     private val onEvent: (VoiceEvent) -> Unit = {},
     private val onSpeechDetected: () -> Unit = {}
@@ -75,10 +84,21 @@ class TvVoiceManager(
         STOPPING
     }
 
+    enum class EndReason {
+        USER_STOPPED,
+        TV_ENDED,
+        INACTIVITY_TIMEOUT,
+        MAX_DURATION
+    }
+
     sealed interface VoiceEvent {
         data class StateChanged(val state: State) : VoiceEvent
         data class SessionStarted(val sessionId: Int) : VoiceEvent
-        data class SessionEnded(val sessionId: Int, val initiatedByTv: Boolean) : VoiceEvent
+        data class SessionEnded(
+            val sessionId: Int,
+            val initiatedByTv: Boolean,
+            val reason: EndReason = if (initiatedByTv) EndReason.TV_ENDED else EndReason.USER_STOPPED
+        ) : VoiceEvent
         data class VoiceBeginTimeout(val detail: String) : VoiceEvent
         data class Error(
             val message: String,
@@ -334,20 +354,24 @@ class TvVoiceManager(
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state.asStateFlow()
 
-    private val lifecycleMutex = Mutex()
     private val sendMutex = Mutex()
+    private val streamSendMutex = Mutex()
+    private val preCaptureLock = Any()
 
     @Volatile
     private var sessionJob: Job? = null
 
     @Volatile
-    private var finalizeJob: Job? = null
+    private var captureJob: Job? = null
 
     @Volatile
     private var captureActive: Boolean = false
 
     @Volatile
-    private var releaseRequested: Boolean = false
+    private var stopRequested: Boolean = false
+
+    @Volatile
+    private var immediateCancelRequested: Boolean = false
 
     @Volatile
     private var activeSessionId: Int? = null
@@ -359,7 +383,13 @@ class TvVoiceManager(
     private var sessionIdDeferred: CompletableDeferred<Int>? = null
 
     @Volatile
-    private var activeScope: CoroutineScope? = null
+    private var stopSignal: CompletableDeferred<Unit>? = null
+
+    @Volatile
+    private var lastSpeechActivityAtMs: Long = 0L
+
+    @Volatile
+    private var captureFailure: Throwable? = null
 
     private fun updateState(next: State) {
         if (_state.value != next) {
@@ -397,13 +427,41 @@ class TvVoiceManager(
     }
 
     /**
-     * Step 1..4 of Push-to-Talk when user presses the mic button (`MotionEvent.ACTION_DOWN`):
-     * Sends `RemoteKeyInject(KEYCODE_SEARCH = 84)`, awaits TV `RemoteVoiceBegin(session_id)`,
-     * replies `RemoteVoiceBegin(session_id, RemoteVoiceConfig(8000, 1, 2))`,
-     * and starts `AudioRecord` streaming `RemoteVoicePayload`.
+     * Tap-to-Talk toggle: starts listening when idle, or ends the active stream with [tailDelayMs]
+     * tail capture when already waiting or streaming.
+     */
+    fun toggleTapToTalk(scope: CoroutineScope) {
+        if (_state.value != State.IDLE) {
+            stopWithTailDelay()
+        } else {
+            startTapToTalk(scope)
+        }
+    }
+
+    /**
+     * Alias for Push-to-Talk callers; delegates to [startTapToTalk].
      */
     fun onPressDown(scope: CoroutineScope) {
-        activeScope = scope
+        startTapToTalk(scope)
+    }
+
+    /**
+     * Alias for Push-to-Talk release callers; delegates to [stopWithTailDelay].
+     */
+    fun onReleaseUp() {
+        stopWithTailDelay()
+    }
+
+    /**
+     * Starts a Tap-to-Talk voice session:
+     * 1. Pre-captures 8 kHz Mono PCM 16-bit immediately (when [preCaptureBeforeVoiceBegin] is true)
+     *    while sending `RemoteKeyInject(KEYCODE_SEARCH = 84, SHORT)`.
+     * 2. Waits for TV's `RemoteVoiceBegin(session_id)` (rejects `< 0` / never synthesizes `-1`).
+     * 3. Replies `RemoteVoiceBegin(session_id, RemoteVoiceConfig(8000, 1, 2))` and flushes pre-captured PCM.
+     * 4. Streams live `RemoteVoicePayload` chunks and monitors silence/duration/stop requests.
+     * 5. On local stop, captures [tailDelayMs] trailing audio, flushes remaining PCM, and sends `RemoteVoiceEnd(session_id)`.
+     */
+    fun startTapToTalk(scope: CoroutineScope) {
         val transport = activeTransport
         if (transport == null || !transport.isConnected) {
             onEvent(VoiceEvent.Error("TV와 TLS 6466 소켓이 연결되어 있지 않습니다."))
@@ -411,30 +469,118 @@ class TvVoiceManager(
         }
 
         val staleJob = sessionJob
-        val staleFinalize = finalizeJob
+        val staleCaptureJob = captureJob
         sessionJob = null
-        finalizeJob = null
-        captureActive = false
-        releaseRequested = false
+        captureJob = null
+        captureActive = true
+        stopRequested = false
+        immediateCancelRequested = false
         tvEndedSession = false
         activeSessionId = null
+        captureFailure = null
         sessionIdDeferred?.cancel()
+        stopSignal?.cancel()
 
         val newBeginSignal = CompletableDeferred<Int>()
+        val newStopSignal = CompletableDeferred<Unit>()
         sessionIdDeferred = newBeginSignal
+        stopSignal = newStopSignal
+        lastSpeechActivityAtMs = System.currentTimeMillis()
         updateState(State.WAITING_FOR_SESSION)
 
         sessionJob = scope.launch(ioDispatcher) {
-            staleFinalize?.cancel()
+            staleCaptureJob?.cancel()
+            runCatching { staleCaptureJob?.join() }
             staleJob?.cancel()
             runCatching { staleJob?.join() }
 
             val accumulator = if (coalesceChunksTo8Kb20Kb) VoiceChunkAccumulator() else null
+            val preCaptureQueue = ArrayDeque<ByteArray>()
+            var preCaptureBytes = 0
             var confirmedSessionId: Int? = null
+            var handshakeReady = false
+            var endReason = EndReason.USER_STOPPED
 
+            suspend fun drainPendingSamplesLocked(sid: Int, extraFrame: ByteArray?) {
+                val pending = ArrayList<ByteArray>()
+                synchronized(preCaptureLock) {
+                    while (preCaptureQueue.isNotEmpty()) {
+                        val queued = preCaptureQueue.removeFirst()
+                        preCaptureBytes = (preCaptureBytes - queued.size).coerceAtLeast(0)
+                        pending.add(queued)
+                    }
+                }
+                if (extraFrame != null && extraFrame.isNotEmpty()) {
+                    pending.add(extraFrame)
+                }
+                for (pcm in pending) {
+                    if (tvEndedSession || !transport.isConnected) break
+                    if (accumulator != null) {
+                        for (chunk in accumulator.append(pcm)) {
+                            if (!tvEndedSession && transport.isConnected) {
+                                sendFrame(transport, buildVoicePayloadMessage(sid, chunk))
+                            }
+                        }
+                    } else {
+                        sendFrame(transport, buildVoicePayloadMessage(sid, pcm))
+                    }
+                }
+            }
+
+            fun launchRecorderJob(): Job = scope.launch(ioDispatcher) {
+                try {
+                    pcmRecorder.record(
+                        bufferSizeBytes = READ_FRAME_BYTES,
+                        isActive = { captureActive && !immediateCancelRequested && !tvEndedSession && transport.isConnected }
+                    ) { pcmBytes ->
+                        if (!captureActive || immediateCancelRequested || pcmBytes.isEmpty()) return@record
+                        if (TvVoiceStreamer.computePcm16PeakAmplitude(pcmBytes) >= TvVoiceStreamer.SPEECH_PEAK_THRESHOLD) {
+                            lastSpeechActivityAtMs = System.currentTimeMillis()
+                            onSpeechDetected()
+                        }
+
+                        var readySid: Int? = null
+                        synchronized(preCaptureLock) {
+                            if (!handshakeReady || confirmedSessionId == null) {
+                                preCaptureQueue.addLast(pcmBytes)
+                                preCaptureBytes += pcmBytes.size
+                                while (preCaptureBytes > MAX_PRECAPTURE_BYTES && preCaptureQueue.isNotEmpty()) {
+                                    val evicted = preCaptureQueue.removeFirst()
+                                    preCaptureBytes = (preCaptureBytes - evicted.size).coerceAtLeast(0)
+                                }
+                            } else {
+                                readySid = confirmedSessionId
+                            }
+                        }
+
+                        val sid = readySid
+                        if (sid != null && !tvEndedSession && !immediateCancelRequested && transport.isConnected) {
+                            streamSendMutex.withLock {
+                                if (!tvEndedSession && !immediateCancelRequested && transport.isConnected) {
+                                    drainPendingSamplesLocked(sid, pcmBytes)
+                                }
+                            }
+                        }
+                    }
+                } catch (_: CancellationException) {
+                    // Normal capture cancellation
+                } catch (t: Throwable) {
+                    captureFailure = t
+                    newBeginSignal.completeExceptionally(t)
+                    newStopSignal.complete(Unit)
+                }
+            }
+
+            var activeCaptureJob: Job? = null
             try {
-                if (releaseRequested) {
+                if (stopRequested || immediateCancelRequested) {
                     return@launch
+                }
+
+                // Start AudioRecord immediately (pre-capture) so first syllables are buffered during TV handshake
+                if (preCaptureBeforeVoiceBegin) {
+                    activeCaptureJob = launchRecorderJob()
+                    captureJob = activeCaptureJob
                 }
 
                 // Step 1: Send RemoteKeyInject(KEYCODE_SEARCH = 84, SHORT)
@@ -445,8 +591,10 @@ class TvVoiceManager(
                     newBeginSignal.await()
                 }
 
+                captureFailure?.let { throw it }
+
                 if (parsedSessionId == null) {
-                    if (!releaseRequested && _state.value == State.WAITING_FOR_SESSION) {
+                    if (!stopRequested && !immediateCancelRequested && _state.value == State.WAITING_FOR_SESSION) {
                         val msg = "TV가 RemoteVoiceBegin 세션을 열지 않았습니다."
                         updateState(State.IDLE)
                         onEvent(VoiceEvent.VoiceBeginTimeout(msg))
@@ -458,7 +606,7 @@ class TvVoiceManager(
                     throw IllegalStateException("TV에서 잘못된 음성 session_id($parsedSessionId)를 반환했습니다.")
                 }
 
-                if (releaseRequested || tvEndedSession || !transport.isConnected) {
+                if (stopRequested || immediateCancelRequested || tvEndedSession || !transport.isConnected) {
                     return@launch
                 }
 
@@ -469,35 +617,58 @@ class TvVoiceManager(
                 // Step 3: Reply RemoteVoiceBegin with parsed session_id + RemoteVoiceConfig(8000, 1, 2)
                 sendFrame(transport, buildVoiceBeginReplyMessage(parsedSessionId))
 
-                if (releaseRequested || tvEndedSession || !transport.isConnected) {
+                if (stopRequested || immediateCancelRequested || tvEndedSession || !transport.isConnected) {
                     return@launch
                 }
 
-                // Step 4: Start AudioRecord (8000 Hz, Mono, PCM 16-bit) and stream RemoteVoicePayload
-                captureActive = true
+                // Step 4: Flush pre-captured PCM and stream live RemoteVoicePayload
                 updateState(State.STREAMING)
                 onEvent(VoiceEvent.SessionStarted(parsedSessionId))
 
-                pcmRecorder.record(
-                    bufferSizeBytes = READ_FRAME_BYTES,
-                    isActive = { captureActive && !releaseRequested && !tvEndedSession && transport.isConnected }
-                ) { pcmBytes ->
-                    if (!captureActive || pcmBytes.isEmpty()) return@record
-                    if (TvVoiceStreamer.computePcm16PeakAmplitude(pcmBytes) >= TvVoiceStreamer.SPEECH_PEAK_THRESHOLD) {
-                        onSpeechDetected()
+                if (activeCaptureJob == null) {
+                    activeCaptureJob = launchRecorderJob()
+                    captureJob = activeCaptureJob
+                }
+
+                streamSendMutex.withLock {
+                    synchronized(preCaptureLock) {
+                        handshakeReady = true
                     }
-                    if (accumulator != null) {
-                        for (chunk in accumulator.append(pcmBytes)) {
-                            if (captureActive && transport.isConnected && !tvEndedSession) {
-                                sendFrame(transport, buildVoicePayloadMessage(parsedSessionId, chunk))
-                            }
-                        }
-                    } else if (transport.isConnected && !tvEndedSession) {
-                        sendFrame(transport, buildVoicePayloadMessage(parsedSessionId, pcmBytes))
+                    drainPendingSamplesLocked(parsedSessionId, extraFrame = null)
+                }
+
+                val streamStartMs = System.currentTimeMillis()
+                if (lastSpeechActivityAtMs < streamStartMs) {
+                    lastSpeechActivityAtMs = streamStartMs
+                }
+
+                while (!stopRequested && !immediateCancelRequested && !tvEndedSession && transport.isConnected) {
+                    captureFailure?.let { throw it }
+                    val now = System.currentTimeMillis()
+                    val idleMs = now - lastSpeechActivityAtMs
+                    val totalMs = now - streamStartMs
+
+                    val noAct = noActivityTimeoutMs
+                    if (noAct != null && idleMs >= noAct) {
+                        endReason = EndReason.INACTIVITY_TIMEOUT
+                        break
+                    }
+                    val maxDur = maxStreamDurationMs
+                    if (maxDur != null && totalMs >= maxDur) {
+                        endReason = EndReason.MAX_DURATION
+                        break
+                    }
+                    val sleepMs = minOf(
+                        100L,
+                        noAct?.let { (it - idleMs).coerceAtLeast(10L) } ?: Long.MAX_VALUE,
+                        maxDur?.let { (it - totalMs).coerceAtLeast(10L) } ?: Long.MAX_VALUE
+                    )
+                    withTimeoutOrNull(sleepMs) {
+                        newStopSignal.await()
                     }
                 }
             } catch (_: CancellationException) {
-                // Cancellation can originate either from onReleaseUp() or scope shutdown
+                // Cancellation from cancel()/onCleared() or TV RemoteVoiceEnd
             } catch (sec: SecurityException) {
                 onEvent(VoiceEvent.Error("RECORD_AUDIO 권한이 필요합니다.", sec))
             } catch (t: Throwable) {
@@ -509,28 +680,66 @@ class TvVoiceManager(
                     )
                 )
             } finally {
-                captureActive = false
                 val sid = confirmedSessionId
-                if (sid != null && !tvEndedSession && transport.isConnected) {
+                val shouldSendEnd = sid != null && !tvEndedSession && !immediateCancelRequested && transport.isConnected
+                if (shouldSendEnd) {
                     updateState(State.STOPPING)
-                    if (accumulator != null) {
-                        for (tailChunk in accumulator.flushPadded()) {
+                    // Tail capture delay: keep recording briefly so trailing syllables aren't clipped
+                    if (tailDelayMs > 0L && captureActive) {
+                        val tailDeadline = System.currentTimeMillis() + tailDelayMs
+                        while (!tvEndedSession && !immediateCancelRequested && transport.isConnected) {
+                            val remaining = tailDeadline - System.currentTimeMillis()
+                            if (remaining <= 0L) break
+                            delay(minOf(remaining, 40L))
+                        }
+                    }
+                }
+
+                captureActive = false
+                if (activeCaptureJob != null) {
+                    withContext(NonCancellable) {
+                        val stoppedCleanly = withTimeoutOrNull(RELEASE_FINISH_GRACE_MS) {
+                            activeCaptureJob.join()
+                            true
+                        } ?: false
+                        if (!stoppedCleanly) {
+                            activeCaptureJob.cancel()
+                            runCatching { activeCaptureJob.join() }
+                        }
+                    }
+                }
+                if (captureJob === activeCaptureJob) {
+                    captureJob = null
+                }
+
+                if (sid != null && shouldSendEnd && !tvEndedSession && !immediateCancelRequested && transport.isConnected) {
+                    withContext(NonCancellable) {
+                        streamSendMutex.withLock {
+                            runCatching { drainPendingSamplesLocked(sid, extraFrame = null) }
+                            if (accumulator != null) {
+                                for (tailChunk in accumulator.flushPadded()) {
+                                    runCatching {
+                                        sendFrame(transport, buildVoicePayloadMessage(sid, tailChunk))
+                                    }
+                                }
+                            }
+                            // Step 5: Send RemoteVoiceEnd(session_id) after tail delay + recording stop + flush
                             runCatching {
-                                sendFrame(transport, buildVoicePayloadMessage(sid, tailChunk))
+                                sendFrame(transport, buildVoiceEndMessage(sid))
                             }
                         }
                     }
-                    // Step 5: Send RemoteVoiceEnd(session_id) after recording stops & flushes
-                    runCatching {
-                        sendFrame(transport, buildVoiceEndMessage(sid))
-                    }
-                    onEvent(VoiceEvent.SessionEnded(sid, initiatedByTv = false))
+                    onEvent(VoiceEvent.SessionEnded(sid, initiatedByTv = false, reason = endReason))
                 }
+
                 if (activeSessionId == sid) {
                     activeSessionId = null
                 }
                 if (sessionIdDeferred === newBeginSignal) {
                     sessionIdDeferred = null
+                }
+                if (stopSignal === newStopSignal) {
+                    stopSignal = null
                 }
                 updateState(State.IDLE)
             }
@@ -538,44 +747,31 @@ class TvVoiceManager(
     }
 
     /**
-     * Step 5 of Push-to-Talk when user lifts their finger (`MotionEvent.ACTION_UP` / `ACTION_CANCEL`):
-     * Stops `AudioRecord` and triggers clean flush + `RemoteVoiceEnd(session_id)` transmission.
-     * If TV never delivered a valid `RemoteVoiceBegin`, aborts waiting without sending `-1`.
+     * Requests a graceful stop with [tailDelayMs] trailing capture, remaining PCM flush,
+     * and `RemoteVoiceEnd(session_id)`. If TV never delivered a valid `RemoteVoiceBegin`,
+     * aborts waiting immediately without sending `-1`.
      */
-    fun onReleaseUp() {
-        releaseRequested = true
-        captureActive = false
+    fun stopWithTailDelay() {
+        stopRequested = true
+        stopSignal?.complete(Unit)
 
         val pendingDeferred = sessionIdDeferred
         if (pendingDeferred != null && !pendingDeferred.isCompleted) {
+            captureActive = false
             pendingDeferred.cancel()
             sessionIdDeferred = null
         }
 
         if (_state.value == State.WAITING_FOR_SESSION && activeSessionId == null) {
+            captureActive = false
+            captureJob?.cancel()
             sessionJob?.cancel()
             updateState(State.IDLE)
             return
         }
 
-        // When STREAMING, setting captureActive=false & releaseRequested=true lets AudioRecord.record()
-        // exit cleanly on the next read and run its finally block (flush + RemoteVoiceEnd).
-        // Launch a safety timeout guard in case a hardware read blocks briefly.
-        val runningJob = sessionJob
-        val scope = activeScope
-        if (runningJob != null && runningJob.isActive && scope != null) {
+        if (_state.value == State.STREAMING) {
             updateState(State.STOPPING)
-            finalizeJob?.cancel()
-            finalizeJob = scope.launch(ioDispatcher) {
-                val finished = withTimeoutOrNull(RELEASE_FINISH_GRACE_MS) {
-                    runningJob.join()
-                    true
-                } ?: false
-                if (!finished) {
-                    runningJob.cancel()
-                    runningJob.join()
-                }
-            }
         }
     }
 
@@ -616,10 +812,12 @@ class TvVoiceManager(
         if (sid != null && (sessionId == sid || sessionId == 0)) {
             tvEndedSession = true
             captureActive = false
+            stopSignal?.complete(Unit)
+            captureJob?.cancel()
             sessionJob?.cancel()
             activeSessionId = null
             updateState(State.IDLE)
-            onEvent(VoiceEvent.SessionEnded(sid, initiatedByTv = true))
+            onEvent(VoiceEvent.SessionEnded(sid, initiatedByTv = true, reason = EndReason.TV_ENDED))
         }
     }
 
@@ -628,9 +826,12 @@ class TvVoiceManager(
         val inFlight = _state.value != State.IDLE || sid != null
         if (!inFlight) return
         tvEndedSession = true
+        immediateCancelRequested = true
         captureActive = false
+        stopSignal?.complete(Unit)
         sessionIdDeferred?.cancel()
         sessionIdDeferred = null
+        captureJob?.cancel()
         sessionJob?.cancel()
         activeSessionId = null
         updateState(State.IDLE)
@@ -638,13 +839,16 @@ class TvVoiceManager(
     }
 
     fun cancel() {
-        releaseRequested = true
+        stopRequested = true
+        immediateCancelRequested = true
         captureActive = false
         tvEndedSession = true
+        stopSignal?.complete(Unit)
+        stopSignal = null
         sessionIdDeferred?.cancel()
         sessionIdDeferred = null
-        finalizeJob?.cancel()
-        finalizeJob = null
+        captureJob?.cancel()
+        captureJob = null
         sessionJob?.cancel()
         sessionJob = null
         activeSessionId = null
@@ -669,7 +873,11 @@ class TvVoiceManager(
         const val VOICE_CHANNEL_CONFIG_MONO = 1
         const val VOICE_AUDIO_FORMAT_PCM_16BIT = 2
         const val READ_FRAME_BYTES = 1600
+        const val MAX_PRECAPTURE_BYTES = 24_000
         const val DEFAULT_VOICE_BEGIN_TIMEOUT_MS = 1_500L
+        const val DEFAULT_TAIL_DELAY_MS = 300L
+        const val DEFAULT_NO_ACTIVITY_TIMEOUT_MS = 3_000L
+        const val DEFAULT_MAX_STREAM_DURATION_MS = 10_000L
         const val DEFAULT_CONNECT_TIMEOUT_MS = 8_000
         const val MAX_FRAME_BYTES = 1024 * 1024
         private const val RELEASE_FINISH_GRACE_MS = 450L

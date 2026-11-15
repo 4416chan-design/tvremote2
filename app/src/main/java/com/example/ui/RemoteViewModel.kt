@@ -1203,13 +1203,26 @@ class RemoteViewModel(
     }
 
     /**
-     * Push-to-Talk (`MotionEvent.ACTION_DOWN`):
-     * Delegates to [TvVoiceManager.onPressDown] for strict Protocol v2 handshake:
-     * `KEYCODE_SEARCH (84)` -> TV `RemoteVoiceBegin(session_id)` ->
-     * `RemoteVoiceBegin(session_id, RemoteVoiceConfig(8000, 1, 2))` -> `AudioRecord` PCM stream.
+     * Tap-to-Talk mic toggle:
+     * - When IDLE: starts immediate pre-capture + `KEYCODE_SEARCH (84)` -> TV `RemoteVoiceBegin(session_id)`
+     *   -> `RemoteVoiceBegin(session_id, RemoteVoiceConfig(8000, 1, 2))` -> `AudioRecord` PCM stream.
+     * - When active: waits trailing capture tail delay, stops `AudioRecord`, flushes PCM, and sends `RemoteVoiceEnd(session_id)`.
      */
-    fun startPushToTalkVoiceSession() {
+    fun toggleTapToTalkVoiceSession() {
         if (!ensureConnectedOrPrompt()) return
+        if (voiceManager.state.value != TvVoiceManager.State.IDLE ||
+            _isVoiceListening.value ||
+            isVoiceFallbackActive ||
+            voiceSessionJob?.isActive == true
+        ) {
+            if (isVoiceFallbackActive || voiceSessionJob?.isActive == true) {
+                stopVoiceSession(sendEndPacket = true)
+            } else {
+                voiceManager.stopWithTailDelay()
+            }
+            return
+        }
+
         _isKeyboardSheetVisible.value = false
         voiceSessionJob?.cancel()
         voiceSessionJob = null
@@ -1242,19 +1255,7 @@ class RemoteViewModel(
             return
         }
 
-        voiceManager.onPressDown(viewModelScope)
-    }
-
-    /**
-     * Push-to-Talk (`MotionEvent.ACTION_UP` / `ACTION_CANCEL`):
-     * Stops `AudioRecord`, flushes remaining PCM, and sends `RemoteVoiceEnd(session_id)`.
-     */
-    fun stopPushToTalkVoiceSession() {
-        if (isVoiceFallbackActive) {
-            stopVoiceSession(sendEndPacket = true)
-            return
-        }
-        voiceManager.onReleaseUp()
+        voiceManager.startTapToTalk(viewModelScope)
     }
 
     private fun handleVoiceManagerEvent(event: TvVoiceManager.VoiceEvent) {
@@ -1283,14 +1284,18 @@ class RemoteViewModel(
                 activeVoiceSessionId = event.sessionId
                 voiceEndedByTv = false
                 refreshVoiceAutoKeyboardSuppression(VOICE_STREAM_MAX_MS + VOICE_AUTO_KEYBOARD_GRACE_MS)
-                showMessage("TV 음성 스트리밍 중 — 버튼에서 손을 떼면 종료됩니다.")
+                showMessage("TV 음성 입력 중 — 말씀하시면 3초 무음 또는 다시 누르면 종료됩니다.")
             }
             is TvVoiceManager.VoiceEvent.SessionEnded -> {
                 if (activeVoiceSessionId == event.sessionId) {
                     activeVoiceSessionId = null
                 }
                 _isVoiceListening.value = false
+                isVoiceInteractionActive = false
                 refreshVoiceAutoKeyboardSuppression()
+                if (event.reason == TvVoiceManager.EndReason.INACTIVITY_TIMEOUT) {
+                    showMessage("음성 입력이 없어 3초 후 마이크를 종료했습니다.")
+                }
             }
             is TvVoiceManager.VoiceEvent.VoiceBeginTimeout -> {
                 _isVoiceListening.value = false

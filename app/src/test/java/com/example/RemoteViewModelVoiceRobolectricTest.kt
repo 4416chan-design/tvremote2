@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class RemoteViewModelVoiceRobolectricTest {
 
     @Test
-    fun `RemoteViewModel push-to-talk start and stop streams RemoteVoiceBegin with config and RemoteVoiceEnd`() {
+    fun `RemoteViewModel tap-to-talk pre-captures, responds RemoteVoiceBegin with config, and captures tail before RemoteVoiceEnd`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -61,16 +61,19 @@ class RemoteViewModelVoiceRobolectricTest {
 
             val sentFrames = CopyOnWriteArrayList<ByteArray>()
             val captureStopped = AtomicBoolean(false)
+            val preCaptureDelivered = AtomicBoolean(false)
 
             viewModel.configureRemoteClientForTest(connected = true) { bytes ->
                 sentFrames.add(bytes)
             }
             viewModel.configureVoiceCaptureForTest { _, isRunning, onFrame ->
                 try {
+                    // Emit 6 * 1600 = 9600 B during pre-capture before TV RemoteVoiceBegin arrives
                     repeat(6) {
                         if (!isRunning()) return@configureVoiceCaptureForTest
                         onFrame(ByteArray(1600) { 0x2A })
                     }
+                    preCaptureDelivered.set(true)
                     while (isRunning()) {
                         delay(15)
                     }
@@ -79,13 +82,14 @@ class RemoteViewModelVoiceRobolectricTest {
                 }
             }
 
-            // 1. ACTION_DOWN triggers KEYCODE_SEARCH(84)
-            viewModel.startPushToTalkVoiceSession()
-            waitUntil(2_000L) { sentFrames.isNotEmpty() }
+            // 1. 1st tap starts pre-capture immediately and sends KEYCODE_SEARCH(84)
+            viewModel.toggleTapToTalkVoiceSession()
+            waitUntil(2_000L) { sentFrames.isNotEmpty() && preCaptureDelivered.get() }
             val firstMsg = TvVoiceManager.readDelimitedMessage(ByteArrayInputStream(sentFrames[0]))
             assertTrue(firstMsg.hasRemoteKeyInject())
             assertEquals(RemoteKeyCode.KEYCODE_SEARCH, firstMsg.remoteKeyInject.keyCode)
             assertEquals(RemoteDirection.SHORT, firstMsg.remoteKeyInject.direction)
+            assertEquals(1, sentFrames.size)
 
             // 2. TV replies RemoteVoiceBegin(session_id = 77)
             runBlocking {
@@ -101,7 +105,7 @@ class RemoteViewModelVoiceRobolectricTest {
                 viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(tvBegin))
             }
 
-            // 3 & 4. Client echoes RemoteVoiceBegin(77, config={8000,1,2}) and streams RemoteVoicePayload(77)
+            // 3 & 4. Client echoes RemoteVoiceBegin(77, config={8000,1,2}) and flushes pre-captured RemoteVoicePayload(77)
             waitUntil(2_500L) {
                 sentFrames.any { bytes ->
                     TvVoiceManager.readDelimitedMessage(ByteArrayInputStream(bytes)).hasRemoteVoicePayload()
@@ -120,8 +124,8 @@ class RemoteViewModelVoiceRobolectricTest {
             assertEquals(77, payload.sessionId)
             assertEquals(9600, payload.samples.size())
 
-            // 5. ACTION_UP stops recording and sends RemoteVoiceEnd(77)
-            viewModel.stopPushToTalkVoiceSession()
+            // 5. 2nd tap enters STOPPING tail delay, stops recorder, and sends RemoteVoiceEnd(77)
+            viewModel.toggleTapToTalkVoiceSession()
             waitUntil(2_500L) {
                 captureStopped.get() && sentFrames.any { bytes ->
                     TvVoiceManager.readDelimitedMessage(ByteArrayInputStream(bytes)).hasRemoteVoiceEnd()
@@ -146,6 +150,6 @@ class RemoteViewModelVoiceRobolectricTest {
             Thread.sleep(10)
         }
         mainLooperShadow.idle()
-        assertTrue("Timed out waiting for Push-to-Talk condition", predicate())
+        assertTrue("Timed out waiting for Tap-to-Talk condition", predicate())
     }
 }

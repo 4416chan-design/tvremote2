@@ -1,6 +1,5 @@
 package com.example.ui
 
-import android.view.MotionEvent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -57,20 +56,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -110,8 +103,7 @@ fun RemoteScreen(
     onKeyPress: (Int) -> Unit,
     onLaunchFavorite: (FavoriteAppEntity) -> Unit,
     onOpenKeyboard: () -> Unit,
-    onMicTouchDown: () -> Unit,
-    onMicTouchUp: () -> Unit,
+    onMicClick: () -> Unit,
     onOpenSettings: () -> Unit,
     onToggleMute: () -> Unit,
     onStepVolume: (Int) -> Unit,
@@ -126,24 +118,19 @@ fun RemoteScreen(
         }
     }
 
-    Scaffold(
-        containerColor = CharcoalBg,
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        snackbarHost = {
-            SnackbarHost(
-                hostState = snackbarHostState,
-                modifier = Modifier.navigationBarsPadding()
-            )
-        }
-    ) { innerPadding ->
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .statusBarsPadding()
-                .navigationBarsPadding(),
-            contentAlignment = Alignment.TopCenter
-        ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = CharcoalBg,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0)
+        ) { innerPadding ->
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .statusBarsPadding()
+                    .navigationBarsPadding(),
+                contentAlignment = Alignment.TopCenter
+            ) {
             val compactHeight = maxHeight < 710.dp
             val dpadDiameter = (maxHeight * 0.28f).coerceIn(184.dp, 240.dp)
             val bigCircleSize = if (compactHeight) 56.dp else 64.dp
@@ -317,7 +304,8 @@ fun RemoteScreen(
                             targetValue = if (isVoiceListening) OnMintGreen else TextPrimary,
                             label = "mic_tint"
                         )
-                        PushToTalkMicButton(
+                        CircleIconRemoteButton(
+                            icon = Icons.Rounded.Mic,
                             contentDescription = stringResource(R.string.btn_mic),
                             size = bigCircleSize,
                             iconSize = 26.dp,
@@ -325,11 +313,10 @@ fun RemoteScreen(
                             iconTint = micTint,
                             borderColor = if (isVoiceListening) MintGreen else CharcoalBorder,
                             testTag = "btn_mic",
-                            onTouchDown = {
+                            onClick = {
                                 triggerHaptic()
-                                onMicTouchDown()
-                            },
-                            onTouchUp = onMicTouchUp
+                                onMicClick()
+                            }
                         )
 
                         CircleIconRemoteButton(
@@ -358,7 +345,18 @@ fun RemoteScreen(
                     }
                 }
             }
+            }
         }
+
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 8.dp, start = 16.dp, end = 16.dp)
+                .widthIn(max = 500.dp)
+                .testTag("top_snackbar_host")
+        )
     }
 }
 
@@ -600,78 +598,6 @@ private fun CircleIconRemoteButton(
     ) {
         Icon(
             imageVector = icon,
-            contentDescription = contentDescription,
-            tint = iconTint,
-            modifier = Modifier.size(iconSize)
-        )
-    }
-}
-
-@OptIn(ExperimentalComposeUiApi::class)
-@Composable
-internal fun PushToTalkMicButton(
-    contentDescription: String,
-    size: Dp,
-    iconSize: Dp,
-    containerColor: Color,
-    iconTint: Color,
-    borderColor: Color,
-    testTag: String,
-    onTouchDown: () -> Unit,
-    onTouchUp: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    var pressed by remember { mutableStateOf(false) }
-    val latestOnTouchDown by rememberUpdatedState(onTouchDown)
-    val latestOnTouchUp by rememberUpdatedState(onTouchUp)
-    val scale by animateFloatAsState(
-        targetValue = if (pressed) 0.91f else 1f,
-        animationSpec = spring(stiffness = 700f),
-        label = "mic_btn_scale"
-    )
-
-    DisposableEffect(Unit) {
-        onDispose {
-            if (pressed) {
-                pressed = false
-                latestOnTouchUp()
-            }
-        }
-    }
-
-    Box(
-        modifier = modifier
-            .minimumInteractiveComponentSize()
-            .size(size)
-            .scale(scale)
-            .clip(CircleShape)
-            .background(containerColor)
-            .border(1.dp, borderColor, CircleShape)
-            .pointerInteropFilter { motionEvent ->
-                when (motionEvent.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        if (!pressed) {
-                            pressed = true
-                            latestOnTouchDown()
-                        }
-                        true
-                    }
-                    MotionEvent.ACTION_UP,
-                    MotionEvent.ACTION_CANCEL -> {
-                        if (pressed) {
-                            pressed = false
-                            latestOnTouchUp()
-                        }
-                        true
-                    }
-                    else -> true
-                }
-            }
-            .testTag(testTag),
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(
-            imageVector = Icons.Rounded.Mic,
             contentDescription = contentDescription,
             tint = iconTint,
             modifier = Modifier.size(iconSize)

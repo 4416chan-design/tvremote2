@@ -1,13 +1,19 @@
 package com.example
 
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
-import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performClick
 import com.example.data.model.TvConnectionState
 import com.example.ui.RemoteScreen
 import com.example.ui.theme.TvRemoteTheme
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -22,11 +28,16 @@ class RemoteScreenVoiceTouchRobolectricTest {
     val composeRule = createComposeRule()
 
     @Test
-    fun `mic button dispatches touch down on ACTION_DOWN and touch up only on ACTION_UP`() {
-        val events = mutableListOf<String>()
+    fun `mic button uses Tap-to-Talk single click toggle and snackbar renders at top`() {
+        var clickCount = 0
+        val snackbarHostState = SnackbarHostState()
+        val noticeText = "음성 입력이 없어 3초 후 마이크를 종료했습니다."
 
         composeRule.setContent {
             TvRemoteTheme {
+                LaunchedEffect(Unit) {
+                    snackbarHostState.showSnackbar(noticeText)
+                }
                 RemoteScreen(
                     connectionState = TvConnectionState.Connected(
                         tvName = "Living Room TV",
@@ -40,13 +51,12 @@ class RemoteScreenVoiceTouchRobolectricTest {
                     brightnessPercent = 60,
                     hapticEnabled = false,
                     isVoiceListening = false,
-                    snackbarHostState = SnackbarHostState(),
+                    snackbarHostState = snackbarHostState,
                     onOpenTvPicker = {},
                     onKeyPress = {},
                     onLaunchFavorite = {},
                     onOpenKeyboard = {},
-                    onMicTouchDown = { events.add("ACTION_DOWN") },
-                    onMicTouchUp = { events.add("ACTION_UP") },
+                    onMicClick = { clickCount++ },
                     onOpenSettings = {},
                     onToggleMute = {},
                     onStepVolume = {},
@@ -57,34 +67,31 @@ class RemoteScreenVoiceTouchRobolectricTest {
             }
         }
 
-        // Hold finger down: ACTION_DOWN fires immediately, ACTION_UP must NOT fire yet
-        composeRule.onNodeWithTag("btn_mic").performTouchInput {
-            down(center)
-        }
         composeRule.waitForIdle()
-        assertEquals(listOf("ACTION_DOWN"), events)
 
-        // Move slightly inside button while still pressed: must not retrigger DOWN or UP
-        composeRule.onNodeWithTag("btn_mic").performTouchInput {
-            moveBy(androidx.compose.ui.geometry.Offset(2f, 2f))
-        }
-        composeRule.waitForIdle()
-        assertEquals(listOf("ACTION_DOWN"), events)
+        // Snackbar must appear at the top of the screen above the bottom action controls
+        composeRule.onNodeWithText(noticeText).assertIsDisplayed()
+        val rootBounds = composeRule.onRoot().getUnclippedBoundsInRoot()
+        val snackbarBounds = composeRule.onNodeWithTag("top_snackbar_host").getUnclippedBoundsInRoot()
+        val micBounds = composeRule.onNodeWithTag("btn_mic").getUnclippedBoundsInRoot()
+        val rootMidY = (rootBounds.top + rootBounds.bottom) / 2f
+        assertTrue(
+            "Expected top_snackbar_host in upper half (top=${snackbarBounds.top}, bottom=${snackbarBounds.bottom}, midY=$rootMidY)",
+            snackbarBounds.bottom < rootMidY
+        )
+        assertTrue(
+            "Expected top_snackbar_host above mic button",
+            snackbarBounds.bottom < micBounds.top
+        )
 
-        // Release finger: ACTION_UP fires once
-        composeRule.onNodeWithTag("btn_mic").performTouchInput {
-            up()
-        }
+        // 1st tap starts session; 2nd tap stops session
+        composeRule.onNodeWithTag("btn_mic").performClick()
         composeRule.waitForIdle()
-        assertEquals(listOf("ACTION_DOWN", "ACTION_UP"), events)
+        assertEquals(1, clickCount)
 
-        // Verify MotionEvent ACTION_CANCEL also releases cleanly
-        composeRule.onNodeWithTag("btn_mic").performTouchInput {
-            down(center)
-            cancel()
-        }
+        composeRule.onNodeWithTag("btn_mic").performClick()
         composeRule.waitForIdle()
-        assertEquals(listOf("ACTION_DOWN", "ACTION_UP", "ACTION_DOWN", "ACTION_UP"), events)
+        assertEquals(2, clickCount)
     }
 }
 
