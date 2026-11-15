@@ -876,7 +876,7 @@ class ProtobufAndCertUnitTest {
             client.sendPhysicalKey(TvKeyCodes.KEYCODE_Q, shift = true)
         }
 
-        assertEquals(3, sentChunks.size)
+        assertEquals(4, sentChunks.size)
         fun keyAndDir(index: Int): Pair<Long, Long> {
             val msg = ProtobufWire.parseFields(
                 ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[index]))
@@ -885,8 +885,9 @@ class ProtobufAndCertUnitTest {
         }
 
         assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDir(0))
-        assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(1))
-        assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(2))
+        assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDir(1))
+        assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(2))
+        assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(3))
 
         sentChunks.clear()
         kotlinx.coroutines.runBlocking {
@@ -895,11 +896,12 @@ class ProtobufAndCertUnitTest {
             client.selectAllAndDelete()
         }
 
-        assertEquals(4, sentChunks.size)
+        assertEquals(5, sentChunks.size)
         assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDir(0))
-        assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(1))
-        assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(2))
-        assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(3))
+        assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDir(1))
+        assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(2))
+        assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(3))
+        assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(4))
         assertEquals("", client.debugTrackedText)
     }
 
@@ -960,7 +962,7 @@ class ProtobufAndCertUnitTest {
         assertEquals(com.example.data.model.TvImeType.GOOGLE_KOREAN, koImeEn.imeType)
         assertTrue(koImeEn.isDetected)
 
-        // Keycombination and Ctrl+A -> DEL command builders
+        // Keycombination and Ctrl+A -> DEL command builders with RC=$? exit-code fallback check
         assertEquals(null, com.example.network.NetworkAdbClient.buildKeyCombinationShellCommand(TvKeyCodes.KEYCODE_A))
         assertEquals(
             "input keycombination 113 29 2>&1",
@@ -968,7 +970,254 @@ class ProtobufAndCertUnitTest {
         )
         val selectAllDeleteCmd = com.example.network.NetworkAdbClient.buildSelectAllAndDeleteShellCommand()
         assertTrue(selectAllDeleteCmd.contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}"))
+        assertTrue(selectAllDeleteCmd.contains("RC=$" + "?"))
+        assertTrue(selectAllDeleteCmd.contains("Usage|Invalid"))
+        assertTrue(selectAllDeleteCmd.contains("sleep 0.1"))
         assertTrue(selectAllDeleteCmd.contains("input keyevent ${TvKeyCodes.DEL} 2>&1"))
-        assertTrue(selectAllDeleteCmd.contains("input keyevent 123"))
+        val expectedFallback = "input keyevent 123 " + List(30) { "67" }.joinToString(" ")
+        assertTrue(selectAllDeleteCmd.contains(expectedFallback))
+    }
+
+    @Test
+    fun `real time phone keyboard edit mapper emits QWER English and Korean 2-bulsik transitions accurately`() {
+        val ime = com.example.data.model.TvImeType.GBOARD
+
+        // 1) English QWERTY typing + Backspace
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_Q))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, "q", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_Q, shift = true))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, "Q", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(
+                    com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_W),
+                    com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_E),
+                    com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_R)
+                )
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("q", 1, 1, "qwer", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(backspaceCount = 1),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("qwer", 4, 4, "qwe", ime)
+        )
+
+        // 2) Korean 2-bulsik progressive composition (ㅂ -> 바 -> 반 -> 반값 -> 반갑사)
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_Q))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, "ㅂ", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_K))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("ㅂ", 1, 1, "바", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_S))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("바", 1, 1, "반", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_K))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("반값", 2, 2, "반갑사", ime)
+        )
+
+        // 3) Compound vowel addition & removal ("오" -> "왜", "과" -> "고")
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_O))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("오", 1, 1, "왜", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(backspaceCount = 1),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("과", 1, 1, "고", ime)
+        )
+
+        // 4) Composing & committed Hangul Backspace ("한" -> "하", "안녕" -> "안")
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(backspaceCount = 1),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("한", 1, 1, "하", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(backspaceCount = 1),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("안녕", 2, 2, "안", ime)
+        )
+
+        // 5) Doubled consonant shift transition ("ㄱ" -> "ㄲ") & no-op commit ("가" -> "가")
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 1,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_R, shift = true))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("ㄱ", 1, 1, "ㄲ", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("가", 1, 1, "가", ime)
+        )
+
+        // 6) Multi-char replacement uses codePointCount (2 syllables, NOT 4 jamo) + emoji single-DEL
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 2,
+                keyActions = listOf(com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_A))
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("가나다", 0, 2, "ㅁ다", ime)
+        )
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(backspaceCount = 1),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("a😀", 3, 3, "a", ime)
+        )
+
+        // 7) Space, newline, digits & ASCII punctuation
+        assertEquals(
+            com.example.data.model.RealTimeTextEditResult(
+                backspaceCount = 0,
+                keyActions = listOf(
+                    com.example.data.model.PhysicalKeyAction(TvKeyCodes.SPACE),
+                    com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_1, shift = true),
+                    com.example.data.model.PhysicalKeyAction(TvKeyCodes.SLASH, shift = true)
+                )
+            ),
+            com.example.data.model.TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, " !?", ime)
+        )
+    }
+
+    @Test
+    fun `voice chunk accumulator and stream pipeline enforce 8KB to 20KB chunks with padded flush`() {
+        val pipeline = com.example.network.VoiceStreamPipeline()
+        val emitted = mutableListOf<Pair<Int, ByteArray>>()
+        val onChunk: suspend (Int, ByteArray) -> Unit = { sid, chunk -> emitted.add(sid to chunk) }
+
+        kotlinx.coroutines.runBlocking {
+            pipeline.beginCapture(generation = 1)
+            // 5 * 1600 = 8000 bytes (< 8192 minimum) remains in buffer even after activateSession
+            repeat(5) { idx ->
+                pipeline.pushFrame(1, ByteArray(1600) { (idx + 1).toByte() }, onChunk)
+            }
+            pipeline.activateSession(generation = 1, sessionId = 9, onChunk = onChunk)
+            assertEquals(0, emitted.size)
+
+            // 6th frame reaches 9600 bytes -> emits single 9600-byte chunk inside [8192, 20480]
+            pipeline.pushFrame(1, ByteArray(1600) { 0x42 }, onChunk)
+            assertEquals(1, emitted.size)
+            assertEquals(9, emitted[0].first)
+            assertEquals(9600, emitted[0].second.size)
+
+            // Oversized 25,000-byte frame must split without emitting any <8192 slice -> [16808, 8192]
+            emitted.clear()
+            val largeFrame = ByteArray(25_000) { i -> ((i and 0x7F) + 1).toByte() }
+            pipeline.pushFrame(1, largeFrame, onChunk)
+            assertEquals(2, emitted.size)
+            assertEquals(16808, emitted[0].second.size)
+            assertEquals(8192, emitted[1].second.size)
+            assertTrue(emitted.all { it.second.size in 8192..20480 && it.second.size % 2 == 0 })
+
+            // Short tail (1600 bytes) is zero-padded up to 8192 bytes on finishAndFlush
+            emitted.clear()
+            val tail = ByteArray(1600) { 0x55 }
+            pipeline.pushFrame(1, tail, onChunk)
+            assertEquals(0, emitted.size)
+            pipeline.finishAndFlush(sessionId = 9, onChunk = onChunk)
+            assertEquals(1, emitted.size)
+            assertEquals(8192, emitted[0].second.size)
+            assertTrue(tail.contentEquals(emitted[0].second.copyOfRange(0, 1600)))
+            assertTrue(emitted[0].second.copyOfRange(1600, 8192).all { it == 0.toByte() })
+
+            // Stale frame generation after reset is ignored cleanly
+            emitted.clear()
+            pipeline.pushFrame(1, ByteArray(10_000) { 0x77 }, onChunk)
+            assertEquals(0, emitted.size)
+        }
+    }
+
+    @Test
+    fun `remote client negotiates FEATURE_VOICE bitmask splits oversized payloads and decodes RemoteError`() {
+        val errorInfos = mutableListOf<com.example.network.AndroidTvRemoteClient.RemoteErrorInfo>()
+        val sentFrames = mutableListOf<ByteArray>()
+        val client = com.example.network.AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = {},
+            onImeShowRequested = { _, _ -> },
+            onVolumeChanged = { _, _, _ -> },
+            onRemoteErrorInfo = { errorInfos.add(it) },
+            onDisconnected = {}
+        ).apply {
+            testRawBytesSink = { sentFrames.add(it) }
+        }
+
+        // Standard Google TV feature flags (623 = PING|KEY|IME|VOICE(8)|POWER(32)|VOLUME(64)|APP_LINK(512))
+        val voiceCapableConfig = ProtobufWire.encode {
+            writeMessageField(1) {
+                writeVarintField(1, 623)
+            }
+        }
+        // TV without FEATURE_VOICE bit (623 & ~8 = 615)
+        val noVoiceConfig = ProtobufWire.encode {
+            writeMessageField(1) {
+                writeVarintField(1, 615)
+            }
+        }
+        // RemoteError wrapping RemoteVoiceBegin(30)
+        val voiceBeginErr = ProtobufWire.encode {
+            writeMessageField(3) {
+                writeBoolField(1, true)
+                writeMessageField(2) {
+                    writeMessageField(30) {
+                        writeVarintField(1, 5)
+                    }
+                }
+            }
+        }
+
+        kotlinx.coroutines.runBlocking {
+            assertEquals(null, client.isVoiceSupportedByTv)
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(voiceCapableConfig))
+            assertEquals(623, client.tvFeatures)
+            assertEquals(true, client.isVoiceSupportedByTv)
+
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(noVoiceConfig))
+            assertEquals(615, client.tvFeatures)
+            assertEquals(false, client.isVoiceSupportedByTv)
+
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(voiceBeginErr))
+            client.sendVoicePayload(7, ByteArray(25_000) { 0x1A })
+        }
+
+        assertEquals(1, errorInfos.size)
+        assertEquals(true, errorInfos[0].value)
+        assertEquals(30, errorInfos[0].offendingFieldNumber)
+        assertTrue(errorInfos[0].detail.contains("field=30"))
+
+        assertEquals(2, sentFrames.size)
+        val p0 = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(sentFrames[0])))
+            .first { it.number == 31 }.asMessage()
+        val p1 = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(sentFrames[1])))
+            .first { it.number == 31 }.asMessage()
+        assertEquals(16808, p0.first { it.number == 2 }.bytes.size)
+        assertEquals(8192, p1.first { it.number == 2 }.bytes.size)
     }
 }

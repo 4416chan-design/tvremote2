@@ -19,6 +19,7 @@ import com.example.network.NetworkAdbClient
 import com.example.network.ProtobufWire
 import com.example.network.TvDiscoveryManager
 import com.example.ui.RemoteViewModel
+import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -36,7 +37,7 @@ import java.util.concurrent.TimeUnit
 class RemoteViewModelTextRoutingTest {
 
     @Test
-    fun `sendKeyboardText sends Korean and ASCII over Protocol v2 even when TV IME flag is inactive`() {
+    fun `sendKeyboardText clears with Ctrl+A DEL before sending Korean and ASCII over Protocol v2`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -57,16 +58,31 @@ class RemoteViewModelTextRoutingTest {
                 sentChunks.add(bytes)
             }
 
+            fun keyAndDirAt(i: Int): Pair<Long, Long> {
+                val msg = ProtobufWire.parseFields(
+                    ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[i]))
+                ).first { it.number == 10 }.asMessage()
+                return msg.first { it.number == 1 }.varint to msg.first { it.number == 2 }.varint
+            }
+
             // Simulate YouTube-style app where TV never emitted RemoteImeShowRequest(22)
             assertFalse(viewModel.imePromptState.value.isTvImeVisible)
 
+            // With ADB disconnected, Send executes Ctrl+A -> DEL over Protocol v2 (5 frames) -> BatchEdit -> ENTER (7 frames)
             viewModel.sendKeyboardText("bts", replaceExisting = true, submitWithEnter = true)
             waitUntil(timeoutMs = 3_000) {
-                sentChunks.size >= 2 && viewModel.snackbarNotice.value != null
+                sentChunks.size >= 7 && viewModel.snackbarNotice.value != null
             }
 
+            assertEquals(7, sentChunks.size)
+            assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(0))
+            assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(1))
+            assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(2))
+            assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(3))
+            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(4))
+
             val firstBatch = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[5]))
             ).first { it.number == 21 }.asMessage()
             assertEquals(0L, firstBatch.first { it.number == 1 }.varint)
             assertEquals(0L, firstBatch.first { it.number == 2 }.varint)
@@ -74,28 +90,28 @@ class RemoteViewModelTextRoutingTest {
             assertEquals("bts", firstObj.first { it.number == 3 }.asString())
             assertEquals(3L, firstObj.first { it.number == 1 }.varint)
 
-            val firstEnter = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[1]))
-            ).first { it.number == 10 }.asMessage()
-            assertEquals(TvKeyCodes.ENTER.toLong(), firstEnter.first { it.number == 1 }.varint)
+            assertEquals(TvKeyCodes.ENTER.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(6))
             assertEquals("TV로 입력을 전송했습니다.", viewModel.snackbarNotice.value?.message)
 
             sentChunks.clear()
             viewModel.clearSnackbar()
 
-            // Korean UTF-8 text must also succeed directly via RemoteImeBatchEdit without false error
+            // Korean UTF-8 text must also clear first via Ctrl+A -> DEL then send RemoteImeBatchEdit + ENTER
             viewModel.sendKeyboardText("유튜브 검색", replaceExisting = true, submitWithEnter = true)
             waitUntil(timeoutMs = 3_000) {
-                sentChunks.size >= 2 && viewModel.snackbarNotice.value != null
+                sentChunks.size >= 7 && viewModel.snackbarNotice.value != null
             }
 
+            assertEquals(7, sentChunks.size)
+            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(4))
             val koBatch = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[5]))
             ).first { it.number == 21 }.asMessage()
             val koObj = koBatch.first { it.number == 3 }.asMessage().first { it.number == 2 }.asMessage()
             assertEquals("유튜브 검색", koObj.first { it.number == 3 }.asString())
             assertEquals(6L, koObj.first { it.number == 1 }.varint)
             assertEquals(6L, koObj.first { it.number == 2 }.varint)
+            assertEquals(TvKeyCodes.ENTER.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(6))
             assertEquals("TV로 입력을 전송했습니다.", viewModel.snackbarNotice.value?.message)
 
             sentChunks.clear()
@@ -104,11 +120,77 @@ class RemoteViewModelTextRoutingTest {
                 sentChunks.size >= 1
             }
 
-            val delKey = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
-            ).first { it.number == 10 }.asMessage()
-            assertEquals(TvKeyCodes.DEL.toLong(), delKey.first { it.number == 1 }.varint)
-            assertEquals(AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), delKey.first { it.number == 2 }.varint)
+            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(0))
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `sendKeyboardText with ADB connected executes ADB keycombination 113 29 + DEL strictly before field text in FIFO order`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            val timeline = CopyOnWriteArrayList<String>()
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val adbCommands = CopyOnWriteArrayList<String>()
+
+            viewModel.configureRemoteClientForTest(connected = true) { bytes ->
+                protocolSent.add(bytes)
+                val fields = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                when {
+                    fields.any { it.number == 10 } -> {
+                        val kc = fields.first { it.number == 10 }.asMessage().first { it.number == 1 }.varint
+                        timeline.add("V2_KEY:$kc")
+                    }
+                    fields.any { it.number == 21 } -> {
+                        val txt = fields.first { it.number == 21 }.asMessage()
+                            .first { it.number == 3 }.asMessage()
+                            .first { it.number == 2 }.asMessage()
+                            .first { it.number == 3 }.asString()
+                        timeline.add("V2_BATCH:$txt")
+                    }
+                }
+            }
+            viewModel.configureAdbClientForTest(connected = true) { cmd ->
+                adbCommands.add(cmd)
+                timeline.add("ADB:$cmd")
+                Result.success("")
+            }
+
+            // Enqueue real-time typing immediately followed by Send: must execute strictly FIFO:
+            // real-time Q, W -> ADB (113 29 -> 67) -> Protocol v2 Batch("유튜브") -> ENTER
+            val editQ = TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, "q", TvImeType.GBOARD)
+            val editW = TvImeKeycodeMap.computeRealTimeEditActions("q", 1, 1, "qw", TvImeType.GBOARD)
+            viewModel.sendRealTimeKeyboardEdit(editQ.backspaceCount, editQ.keyActions)
+            viewModel.sendRealTimeKeyboardEdit(editW.backspaceCount, editW.keyActions)
+            viewModel.sendKeyboardText("유튜브", replaceExisting = true, submitWithEnter = true)
+
+            waitUntil(timeoutMs = 3_000) {
+                timeline.size >= 5 && viewModel.snackbarNotice.value != null
+            }
+
+            assertEquals(1, adbCommands.size)
+            assertTrue(adbCommands[0].contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}"))
+            assertTrue(adbCommands[0].contains("input keyevent ${TvKeyCodes.DEL} 2>&1"))
+            assertEquals("V2_KEY:${TvKeyCodes.KEYCODE_Q}", timeline[0])
+            assertEquals("V2_KEY:${TvKeyCodes.KEYCODE_W}", timeline[1])
+            assertTrue(timeline[2].startsWith("ADB:"))
+            assertEquals("V2_BATCH:유튜브", timeline[3])
+            assertEquals("V2_KEY:${TvKeyCodes.ENTER}", timeline[4])
+            assertEquals(4, protocolSent.size)
         } finally {
             store.clear()
             db.close()
@@ -137,9 +219,10 @@ class RemoteViewModelTextRoutingTest {
             }
 
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = false)
-            waitUntil(timeoutMs = 2_000) { sentChunks.size >= 1 }
+            waitUntil(timeoutMs = 2_000) { sentChunks.size >= 6 }
+            assertEquals(6, sentChunks.size)
             val clearFields = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[5]))
             )
             assertFalse(clearFields.any { it.number == 20 })
             val clearObj = clearFields.first { it.number == 21 }.asMessage()
@@ -149,12 +232,17 @@ class RemoteViewModelTextRoutingTest {
 
             sentChunks.clear()
 
-            // Pressing "전송" on an empty box (submitWithEnter = true): clears first then emits KEYCODE_ENTER
+            // Pressing "전송" on an empty box (submitWithEnter = true): Ctrl+A -> DEL, empty BatchEdit, then ENTER
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
-            waitUntil(timeoutMs = 2_000) { sentChunks.size >= 2 }
-            assertEquals(2, sentChunks.size)
+            waitUntil(timeoutMs = 2_000) { sentChunks.size >= 7 }
+            assertEquals(7, sentChunks.size)
+            val delKey = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[4]))
+            ).first { it.number == 10 }.asMessage()
+            assertEquals(TvKeyCodes.DEL.toLong(), delKey.first { it.number == 1 }.varint)
+
             val emptyBatch = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[0]))
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[5]))
             ).first { it.number == 21 }.asMessage()
             assertEquals(
                 "",
@@ -163,7 +251,7 @@ class RemoteViewModelTextRoutingTest {
                     .first { it.number == 3 }.asString()
             )
             val enterFields = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[1]))
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[6]))
             )
             val keyMsg = enterFields.first { it.number == 10 }.asMessage()
             assertEquals(TvKeyCodes.ENTER.toLong(), keyMsg.first { it.number == 1 }.varint)
@@ -174,7 +262,7 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `raw ADB fallback still clears before Enter on empty Send and routes Backspace to DEL`() {
+    fun `raw ADB fallback runs keycombination 113 29 DEL before input text and Enter and routes Backspace to DEL`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -198,13 +286,24 @@ class RemoteViewModelTextRoutingTest {
                 Result.success("")
             }
 
+            // Empty Send in ADB fallback: Ctrl+A -> DEL first, then ENTER
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
             waitUntil(timeoutMs = 3_000) {
-                adbCommands.any { it.contains("input keyevent 123") }
+                adbCommands.size >= 2
             }
-            val clearEnterCmd = adbCommands.first { it.contains("input keyevent 123") }
-            assertTrue(clearEnterCmd.contains("67"))
-            assertTrue(clearEnterCmd.contains("input keyevent 66 2>&1"))
+            assertTrue(adbCommands[0].contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}"))
+            assertTrue(adbCommands[0].contains("input keyevent ${TvKeyCodes.DEL} 2>&1"))
+            assertEquals("input keyevent ${TvKeyCodes.ENTER} 2>&1", adbCommands[1])
+
+            // Non-empty ASCII Send in ADB fallback: Ctrl+A -> DEL first, then input text + ENTER without redundant 20x DEL
+            adbCommands.clear()
+            viewModel.sendKeyboardText("hello tv", replaceExisting = true, submitWithEnter = true)
+            waitUntil(timeoutMs = 3_000) {
+                adbCommands.size >= 2
+            }
+            assertTrue(adbCommands[0].contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}"))
+            assertTrue(adbCommands[0].contains("input keyevent ${TvKeyCodes.DEL} 2>&1"))
+            assertEquals("input text 'hello%stv' 2>&1; input keyevent ${TvKeyCodes.ENTER} 2>&1", adbCommands[1])
 
             adbCommands.clear()
             viewModel.sendKeyboardBackspace(1)
@@ -219,7 +318,7 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `tv IME detection syncs initial language and physical keys plus toggleLanguage emit correct keycodes`() {
+    fun `tv IME detection syncs initial language and real-time edits plus toggleLanguage emit FIFO keycodes`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -258,35 +357,47 @@ class RemoteViewModelTextRoutingTest {
             assertEquals(TvImeType.GBOARD, viewModel.tvImeStatus.value.imeType)
             assertTrue(viewModel.tvImeStatus.value.isDetected)
 
-            // Pressing ㅂ (id="q") sends KEYCODE_Q (45) without Shift
-            viewModel.sendPhysicalKey(TvImeKeycodeMap.findSpecById("q")!!, shift = false)
-            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
-            val keyMsg = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
-            ).first { it.number == 10 }.asMessage()
-            assertEquals(TvKeyCodes.KEYCODE_Q.toLong(), keyMsg.first { it.number == 1 }.varint)
-            assertEquals(AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyMsg.first { it.number == 2 }.varint)
+            // Typing Q, W, E, R + Backspace + Korean 바 -> strictly FIFO KeyEvent packets
+            fun keyAndDirAt(i: Int): Pair<Long, Long> {
+                val msg = ProtobufWire.parseFields(
+                    ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[i]))
+                ).first { it.number == 10 }.asMessage()
+                return msg.first { it.number == 1 }.varint to msg.first { it.number == 2 }.varint
+            }
+
+            val qwerEdit = TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, "qwer", TvImeType.GBOARD)
+            viewModel.sendRealTimeKeyboardEdit(qwerEdit.backspaceCount, qwerEdit.keyActions)
+            viewModel.sendKeyboardBackspace(1)
+            val koEdit = TvImeKeycodeMap.computeRealTimeEditActions("ㅂ", 1, 1, "바", TvImeType.GBOARD)
+            viewModel.sendRealTimeKeyboardEdit(koEdit.backspaceCount, koEdit.keyActions)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 6 }
+
+            assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(0))
+            assertEquals(TvKeyCodes.KEYCODE_W.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(1))
+            assertEquals(TvKeyCodes.KEYCODE_E.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(2))
+            assertEquals(TvKeyCodes.KEYCODE_R.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(3))
+            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(4))
+            assertEquals(TvKeyCodes.KEYCODE_K.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(5))
 
             // Toggling language on Gboard switches to ENGLISH and sends KEYCODE_LANGUAGE_SWITCH (204)
             protocolSent.clear()
             viewModel.toggleKeyboardLanguage()
             assertEquals(TvKeyboardLanguage.ENGLISH, viewModel.keyboardLanguage.value)
             waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
-            val switchMsg = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
-            ).first { it.number == 10 }.asMessage()
-            assertEquals(TvKeyCodes.LANGUAGE_SWITCH.toLong(), switchMsg.first { it.number == 1 }.varint)
+            assertEquals(
+                TvKeyCodes.LANGUAGE_SWITCH.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(),
+                keyAndDirAt(0)
+            )
 
-            // Shifted Q sends SHIFT_LEFT START -> Q SHORT -> SHIFT_LEFT END
+            // Shifted uppercase Q sends SHIFT_LEFT START -> Q START -> Q END -> SHIFT_LEFT END
             protocolSent.clear()
-            viewModel.sendPhysicalKey(TvImeKeycodeMap.findSpecById("q")!!, shift = true)
-            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 3 }
-            fun codeAt(i: Int): Long = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[i]))
-            ).first { it.number == 10 }.asMessage().first { it.number == 1 }.varint
-            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(0))
-            assertEquals(TvKeyCodes.KEYCODE_Q.toLong(), codeAt(1))
-            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(2))
+            val shiftQ = TvImeKeycodeMap.computeRealTimeEditActions("", 0, 0, "Q", TvImeType.GBOARD)
+            viewModel.sendRealTimeKeyboardEdit(shiftQ.backspaceCount, shiftQ.keyActions)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 4 }
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(0))
+            assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(1))
+            assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(2))
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(3))
 
             // Resync onto Google Korean IME -> switching language uses SHIFT_LEFT + SPACE
             imeDump = """
@@ -307,10 +418,11 @@ class RemoteViewModelTextRoutingTest {
             protocolSent.clear()
             viewModel.toggleKeyboardLanguage()
             assertEquals(TvKeyboardLanguage.ENGLISH, viewModel.keyboardLanguage.value)
-            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 3 }
-            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(0))
-            assertEquals(TvKeyCodes.SPACE.toLong(), codeAt(1))
-            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(2))
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 4 }
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(0))
+            assertEquals(TvKeyCodes.SPACE.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(1))
+            assertEquals(TvKeyCodes.SPACE.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(2))
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(3))
         } finally {
             store.clear()
             db.close()
@@ -318,7 +430,7 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `clearKeyboardWithSelectAllDelete sends Ctrl+A then DEL over Protocol v2 and falls back to ADB`() {
+    fun `clearKeyboardWithSelectAllDelete prefers ADB keycombination first and falls back to Protocol v2`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -334,10 +446,26 @@ class RemoteViewModelTextRoutingTest {
             )
             val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
             val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val adbCommands = CopyOnWriteArrayList<String>()
             viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+            viewModel.configureAdbClientForTest(connected = true) { cmd ->
+                adbCommands.add(cmd)
+                Result.success("")
+            }
 
+            // When both ADB and Protocol v2 are connected, ADB runs FIRST so TV receives true CTRL+A
             viewModel.clearKeyboardWithSelectAllDelete()
-            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 4 }
+            waitUntil(timeoutMs = 3_000) {
+                adbCommands.any { it.contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}") }
+            }
+            val cmd = adbCommands.first { it.contains("input keycombination") }
+            assertTrue(cmd.contains("input keyevent ${TvKeyCodes.DEL} 2>&1"))
+            assertEquals(0, protocolSent.size)
+
+            // When ADB is unavailable or fails, fall back to Protocol v2 5-frame Ctrl+A -> DEL
+            viewModel.configureAdbClientForTest(connected = false, shellRunner = null)
+            viewModel.clearKeyboardWithSelectAllDelete()
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 5 }
 
             fun keyAndDirAt(i: Int): Pair<Long, Long> {
                 val msg = ProtobufWire.parseFields(
@@ -346,25 +474,10 @@ class RemoteViewModelTextRoutingTest {
                 return msg.first { it.number == 1 }.varint to msg.first { it.number == 2 }.varint
             }
             assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(0))
-            assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(1))
-            assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(2))
-            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(3))
-
-            // ADB fallback when Protocol v2 write drops
-            val adbCommands = CopyOnWriteArrayList<String>()
-            viewModel.configureRemoteClientForTest(connected = true) {
-                throw java.io.IOException("simulated Protocol v2 write drop")
-            }
-            viewModel.configureAdbClientForTest(connected = true) { cmd ->
-                adbCommands.add(cmd)
-                Result.success("")
-            }
-            viewModel.clearKeyboardWithSelectAllDelete()
-            waitUntil(timeoutMs = 3_000) {
-                adbCommands.any { it.contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}") }
-            }
-            val cmd = adbCommands.first { it.contains("input keycombination") }
-            assertTrue(cmd.contains("input keyevent ${TvKeyCodes.DEL}"))
+            assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(1))
+            assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(2))
+            assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(3))
+            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(4))
         } finally {
             store.clear()
             db.close()
@@ -425,6 +538,363 @@ class RemoteViewModelTextRoutingTest {
         } finally {
             upgradedDb.close()
             dbFile.delete()
+        }
+    }
+
+    @Test
+    fun `startVoiceSession sends single SEARCH suppresses Katniss popup and streams 8KB-20KB PCM with padded tail`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.setAutoShowKeyboard(true)
+            waitUntil(timeoutMs = 2_000) { viewModel.preferences.value.autoShowKeyboard }
+
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val pushedFrames = java.util.concurrent.atomic.AtomicInteger(0)
+            val sendTailNow = java.util.concurrent.atomic.AtomicBoolean(false)
+            val tailPushed = java.util.concurrent.atomic.AtomicBoolean(false)
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+            viewModel.configureVoiceCaptureForTest { _, isRunning, onFrame ->
+                // Emit 6 * 1600 = 9600 bytes for initial pre-buffer
+                repeat(6) { idx ->
+                    if (!isRunning()) return@configureVoiceCaptureForTest
+                    onFrame(ByteArray(1600) { (idx + 1).toByte() })
+                    pushedFrames.incrementAndGet()
+                }
+                while (isRunning() && !sendTailNow.get()) {
+                    kotlinx.coroutines.delay(10)
+                }
+                if (isRunning() && sendTailNow.get()) {
+                    onFrame(ByteArray(1600) { 0x5A })
+                    tailPushed.set(true)
+                }
+                while (isRunning()) {
+                    kotlinx.coroutines.delay(10)
+                }
+            }
+
+            kotlinx.coroutines.runBlocking {
+                val configBytes = ProtobufWire.encode {
+                    writeMessageField(1) { writeVarintField(1, 623) }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(configBytes))
+            }
+            assertEquals(true, viewModel.tvVoiceSupportedForTest)
+
+            viewModel.startVoiceSession()
+            waitUntil(timeoutMs = 3_000) {
+                protocolSent.isNotEmpty() && pushedFrames.get() >= 6
+            }
+
+            // First key must be single KEYCODE_SEARCH (84) and never VOICE_ASSIST (231)
+            val firstFields = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
+            )
+            assertEquals(
+                TvKeyCodes.SEARCH.toLong(),
+                firstFields.first { it.number == 10 }.asMessage().first { it.number == 1 }.varint
+            )
+
+            // Simulate Xiaomi / Google TV Katniss IME show request while waiting for RemoteVoiceBegin
+            kotlinx.coroutines.runBlocking {
+                val katnissShow = ProtobufWire.encode {
+                    writeMessageField(20) {
+                        writeMessageField(1) {
+                            writeVarintField(1, 5)
+                            writeStringField(12, "com.google.android.katniss")
+                        }
+                        writeMessageField(2) {
+                            writeVarintField(1, 68)
+                            writeVarintField(5, 1)
+                        }
+                    }
+                    writeMessageField(22) {
+                        writeMessageField(2) {
+                            writeVarintField(1, 68)
+                            writeVarintField(5, 1)
+                        }
+                    }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(katnissShow))
+            }
+            assertTrue(viewModel.imePromptState.value.isTvImeVisible)
+            assertFalse(viewModel.isKeyboardSheetVisible.value)
+
+            // TV opens RemoteVoiceBegin(sessionId = 42)
+            kotlinx.coroutines.runBlocking {
+                val voiceBegin = ProtobufWire.encode {
+                    writeMessageField(30) {
+                        writeVarintField(1, 42)
+                        writeStringField(2, "com.google.android.katniss")
+                    }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(voiceBegin))
+            }
+
+            waitUntil(timeoutMs = 3_000) {
+                protocolSent.any { bytes ->
+                    ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                        .any { it.number == 31 }
+                }
+            }
+            assertFalse(viewModel.isKeyboardSheetVisible.value)
+
+            // Feed 1600-byte tail frame while session active, then stop cleanly -> zero-padded 8192 B chunk -> RemoteVoiceEnd(42)
+            sendTailNow.set(true)
+            waitUntil(timeoutMs = 2_000) { tailPushed.get() }
+            viewModel.stopVoiceSession(sendEndPacket = true)
+            waitUntil(timeoutMs = 3_000) {
+                protocolSent.any { bytes ->
+                    ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                        .any { it.number == 32 }
+                }
+            }
+
+            val decoded = protocolSent.map { bytes ->
+                ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+            }
+            assertFalse(
+                decoded.any { fields ->
+                    fields.any { it.number == 10 } &&
+                        fields.first { it.number == 10 }.asMessage().first { it.number == 1 }.varint == TvKeyCodes.VOICE_ASSIST.toLong()
+                }
+            )
+            val payloads = decoded.filter { f -> f.any { it.number == 31 } }
+                .map { f -> f.first { it.number == 31 }.asMessage() }
+            assertEquals(2, payloads.size)
+            assertEquals(42L, payloads[0].first { it.number == 1 }.varint)
+            assertEquals(9600, payloads[0].first { it.number == 2 }.bytes.size)
+
+            val tailSamples = payloads[1].first { it.number == 2 }.bytes
+            assertEquals(42L, payloads[1].first { it.number == 1 }.varint)
+            assertEquals(8192, tailSamples.size)
+            assertTrue(tailSamples.copyOfRange(0, 1600).all { it == 0x5A.toByte() })
+            assertTrue(tailSamples.copyOfRange(1600, 8192).all { it == 0.toByte() })
+            assertTrue(payloads.all { it.first { f -> f.number == 2 }.bytes.size in 8192..20480 })
+
+            val endIdx = decoded.indexOfFirst { f -> f.any { it.number == 32 } }
+            val lastPayloadIdx = decoded.indexOfLast { f -> f.any { it.number == 31 } }
+            assertTrue(endIdx > lastPayloadIdx)
+            assertEquals(42L, decoded[endIdx].first { it.number == 32 }.asMessage().first { it.number == 1 }.varint)
+
+            // Trailing Katniss show request within grace window remains suppressed; manual open clears suppression
+            kotlinx.coroutines.runBlocking {
+                val trailingShow = ProtobufWire.encode {
+                    writeMessageField(22) {
+                        writeMessageField(2) { writeVarintField(1, 69) }
+                    }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(trailingShow))
+            }
+            assertFalse(viewModel.isKeyboardSheetVisible.value)
+
+            viewModel.openKeyboardSheet()
+            assertTrue(viewModel.isKeyboardSheetVisible.value)
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `voice fallback triggers immediately when FEATURE_VOICE omitted and keeps mobile keyboard hidden across search injection`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.setAutoShowKeyboard(true)
+            waitUntil(timeoutMs = 2_000) { viewModel.preferences.value.autoShowKeyboard }
+
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+
+            val fallbackCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val collectScope = kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate
+            )
+            val collectorJob = collectScope.launch {
+                viewModel.voiceFallbackRequests.collect {
+                    fallbackCount.incrementAndGet()
+                }
+            }
+
+            try {
+                // TV feature flags = 615 (bit 8 FEATURE_VOICE missing)
+                kotlinx.coroutines.runBlocking {
+                    val cfg = ProtobufWire.encode {
+                        writeMessageField(1) { writeVarintField(1, 615) }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(cfg))
+                }
+                assertEquals(false, viewModel.tvVoiceSupportedForTest)
+
+                viewModel.startVoiceSession()
+                waitUntil(timeoutMs = 1_500) { fallbackCount.get() == 1 }
+                assertFalse(viewModel.isVoiceListening.value)
+                assertFalse(viewModel.isKeyboardSheetVisible.value)
+
+                // SpeechRecognizer delivers recognized query -> viewModel sends SEARCH, awaits IME without popping sheet, sends BatchEdit + ENTER
+                viewModel.onVoiceSearchRecognized("오늘 날씨")
+                waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
+                assertEquals(
+                    TvKeyCodes.SEARCH.toLong(),
+                    ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0])))
+                        .first { it.number == 10 }.asMessage().first { it.number == 1 }.varint
+                )
+
+                kotlinx.coroutines.runBlocking {
+                    val searchShow = ProtobufWire.encode {
+                        writeMessageField(22) {
+                            writeMessageField(2) {
+                                writeVarintField(1, 12)
+                                writeVarintField(5, 1)
+                            }
+                        }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(searchShow))
+                }
+
+                waitUntil(timeoutMs = 3_000) {
+                    protocolSent.any { bytes ->
+                        val f = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                        f.any { it.number == 10 } &&
+                            f.first { it.number == 10 }.asMessage().first { it.number == 1 }.varint == TvKeyCodes.ENTER.toLong()
+                    }
+                }
+                assertFalse(viewModel.isKeyboardSheetVisible.value)
+                assertEquals("\"오늘 날씨\" 음성 검색 전송", viewModel.snackbarNotice.value?.message)
+            } finally {
+                collectorJob.cancel()
+            }
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `remote voice error aborts active stream into fallback without opening mobile keyboard`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.setAutoShowKeyboard(true)
+            waitUntil(timeoutMs = 2_000) { viewModel.preferences.value.autoShowKeyboard }
+
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val captureStopped = java.util.concurrent.atomic.AtomicBoolean(false)
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+            viewModel.configureVoiceCaptureForTest { _, isRunning, _ ->
+                try {
+                    while (isRunning()) {
+                        kotlinx.coroutines.delay(15)
+                    }
+                } finally {
+                    captureStopped.set(true)
+                }
+            }
+
+            val fallbackCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val collectScope = kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate
+            )
+            val collectorJob = collectScope.launch {
+                viewModel.voiceFallbackRequests.collect {
+                    fallbackCount.incrementAndGet()
+                }
+            }
+
+            try {
+                kotlinx.coroutines.runBlocking {
+                    val cfg = ProtobufWire.encode {
+                        writeMessageField(1) { writeVarintField(1, 623) }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(cfg))
+                }
+                viewModel.startVoiceSession()
+                waitUntil(timeoutMs = 2_000) { protocolSent.isNotEmpty() }
+
+                kotlinx.coroutines.runBlocking {
+                    val voiceBegin = ProtobufWire.encode {
+                        writeMessageField(30) {
+                            writeVarintField(1, 7)
+                            writeStringField(2, "com.google.android.katniss")
+                        }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(voiceBegin))
+                }
+                waitUntil(timeoutMs = 2_000) {
+                    protocolSent.any { bytes ->
+                        ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                            .any { it.number == 30 }
+                    }
+                }
+
+                // TV rejects voice payload with RemoteError(3) wrapping remote_voice_payload(31)
+                kotlinx.coroutines.runBlocking {
+                    val voiceErr = ProtobufWire.encode {
+                        writeMessageField(3) {
+                            writeBoolField(1, true)
+                            writeMessageField(2) {
+                                writeMessageField(31) {
+                                    writeVarintField(1, 7)
+                                }
+                            }
+                        }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(voiceErr))
+                }
+
+                waitUntil(timeoutMs = 3_000) {
+                    fallbackCount.get() == 1 && captureStopped.get()
+                }
+                assertFalse(viewModel.isVoiceListening.value)
+                assertTrue(viewModel.snackbarNotice.value?.message.orEmpty().contains("휴대폰 음성 인식"))
+
+                kotlinx.coroutines.runBlocking {
+                    val showReq = ProtobufWire.encode {
+                        writeMessageField(22) { writeMessageField(2) { writeVarintField(1, 1) } }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(showReq))
+                }
+                assertFalse(viewModel.isKeyboardSheetVisible.value)
+            } finally {
+                collectorJob.cancel()
+            }
+        } finally {
+            store.clear()
+            db.close()
         }
     }
 

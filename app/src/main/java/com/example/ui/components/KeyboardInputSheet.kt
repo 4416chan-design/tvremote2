@@ -1,5 +1,6 @@
 package com.example.ui.components
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,11 +24,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Backspace
-import androidx.compose.material.icons.automirrored.rounded.KeyboardReturn
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Keyboard
-import androidx.compose.material.icons.rounded.KeyboardCapslock
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -68,8 +67,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.example.data.model.PhysicalKeySpec
+import com.example.data.model.PhysicalKeyAction
 import com.example.data.model.TvImeKeycodeMap
 import com.example.data.model.TvImeStatus
 import com.example.data.model.TvKeyboardLanguage
@@ -81,15 +79,15 @@ import com.example.ui.theme.CharcoalSurfaceElevated
 import com.example.ui.theme.CharcoalWell
 import com.example.ui.theme.DividerSubtle
 import com.example.ui.theme.MintGreen
-import com.example.ui.theme.MintGreenContainer
 import com.example.ui.theme.OnMintGreen
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 
 /**
- * Dual-mode Korean + English keyboard sheet for Android TV:
- * 1) Full text-field submission (`전체 교체 전송` + real-time Backspace).
- * 2) Direct physical-key keypad (`QWERTY / 두벌식 한·영 전환`) mapped per TV IME without phone IME composition.
+ * Keyboard input bottom sheet for Android TV:
+ * 1) Real-time physical KeyEvent streaming directly from phone native keyboard typing & Backspace.
+ * 2) Full-field replacement submission (`전송`: replace existing text + Enter).
+ * 3) Always-enabled `전체 지우기` (`Ctrl+A -> DEL`) regardless of local text field state.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -102,7 +100,7 @@ fun KeyboardInputSheet(
     tvImeStatus: TvImeStatus = TvImeStatus(),
     onToggleLanguage: () -> Unit = {},
     onResyncTvIme: () -> Unit = {},
-    onPhysicalKeyPress: (PhysicalKeySpec, Boolean) -> Unit = { _, _ -> },
+    onRealTimeKeyEdit: (backspaceCount: Int, keyActions: List<PhysicalKeyAction>) -> Unit = { _, _ -> },
     onClearAll: () -> Unit = {},
     onSendText: (text: String, replaceExisting: Boolean, submitWithEnter: Boolean) -> Unit,
     onSendKey: (Int) -> Unit,
@@ -122,7 +120,6 @@ fun KeyboardInputSheet(
         )
     }
     var userEditedLocally by remember { mutableStateOf(false) }
-    var isShiftActive by remember { mutableStateOf(false) }
 
     LaunchedEffect(initialText) {
         if (!userEditedLocally && fieldValue.text.isEmpty() && initialText.isNotEmpty()) {
@@ -174,11 +171,11 @@ fun KeyboardInputSheet(
                     val tvLangLabel = if (tvImeStatus.language == TvKeyboardLanguage.KOREAN) "한글" else "영문"
                     val (statusText, statusColor) = when {
                         tvImeStatus.isDetected ->
-                            "TV IME: $tvLangLabel (${tvImeStatus.imeType.displayName}) · 물리키 실시간/텍스트 전송" to MintGreen
+                            "TV IME: $tvLangLabel (${tvImeStatus.imeType.displayName}) · 폰 키보드 실시간 키코드 전송" to MintGreen
                         isTvImeVisible ->
-                            "TV 입력창 연결됨 · 물리키 실시간 / 텍스트 전송" to MintGreen
+                            "TV 입력창 연결됨 · 폰 키보드 실시간 / 전체 전송" to MintGreen
                         else ->
-                            "물리키 자판으로 바로 입력하거나 텍스트 입력 후 전송하세요" to (
+                            "폰 키보드로 입력하면 키코드가 TV로 실시간 전송됩니다" to (
                                 if (isAdbConnected) MintGreen else TextSecondary
                                 )
                     }
@@ -224,9 +221,19 @@ fun KeyboardInputSheet(
                     val previousValue = fieldValue
                     userEditedLocally = true
                     fieldValue = next
-                    val deletedCount = computeRealTimeBackspaceCount(previousValue, next)
-                    if (deletedCount > 0) {
-                        onBackspace(deletedCount)
+                    val edit = TvImeKeycodeMap.computeRealTimeEditActions(
+                        previousText = previousValue.text,
+                        previousSelStart = previousValue.selection.min,
+                        previousSelEnd = previousValue.selection.max,
+                        nextText = next.text,
+                        imeType = tvImeStatus.imeType
+                    )
+                    if (edit.backspaceCount > 0 || edit.keyActions.isNotEmpty()) {
+                        if (edit.keyActions.isEmpty()) {
+                            onBackspace(edit.backspaceCount)
+                        } else {
+                            onRealTimeKeyEdit(edit.backspaceCount, edit.keyActions)
+                        }
                     }
                 },
                 modifier = Modifier
@@ -247,7 +254,7 @@ fun KeyboardInputSheet(
                     .testTag("tv_keyboard_input_field"),
                 placeholder = {
                     Text(
-                        text = "$tvName 에 전송할 텍스트를 입력하세요...",
+                        text = "$tvName 에 실시간 입력 (또는 입력 후 전송)...",
                         color = TextSecondary
                     )
                 },
@@ -273,43 +280,41 @@ fun KeyboardInputSheet(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Text Field Pill Buttons: 전체 지우기 (Ctrl+A -> DEL) | 전송
+            // Text Field Pill Buttons: Always-enabled 전체 지우기 (Ctrl+A -> DEL) | 전송
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Surface(
-                    color = CharcoalSurface,
+                Button(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        userEditedLocally = true
+                        fieldValue = TextFieldValue("")
+                        onClearAll()
+                    },
+                    enabled = true,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CharcoalSurfaceElevated,
+                        contentColor = TextPrimary
+                    ),
+                    border = BorderStroke(1.dp, CharcoalBorder),
                     shape = CircleShape,
                     modifier = Modifier
                         .weight(1f)
                         .height(46.dp)
-                        .clip(CircleShape)
-                        .border(1.dp, CharcoalBorder, CircleShape)
-                        .clickable {
-                            userEditedLocally = true
-                            fieldValue = TextFieldValue("")
-                            onClearAll()
-                        }
                         .testTag("keyboard_clear_button")
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.Backspace,
-                            contentDescription = null,
-                            tint = TextSecondary,
-                            modifier = Modifier.size(17.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "전체 지우기",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = TextSecondary
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.Backspace,
+                        contentDescription = null,
+                        modifier = Modifier.size(17.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "전체 지우기",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
 
                 val hasText = fieldValue.text.isNotEmpty()
@@ -339,19 +344,19 @@ fun KeyboardInputSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
             HorizontalDivider(color = DividerSubtle, thickness = 1.dp)
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Real-time Physical Keypad Header Bar: Mode label + Resync + 영/한 Switcher
+            // Compact TV IME status sync & 한/영 toggle strip (no custom keyboard grid)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
-                    text = "물리키 실시간 입력",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = TextPrimary
+                    text = "TV 한/영 전환",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary
                 )
                 if (isAdbConnected) {
                     Spacer(modifier = Modifier.width(8.dp))
@@ -393,7 +398,6 @@ fun KeyboardInputSheet(
                         .border(1.dp, CharcoalBorder, CircleShape)
                         .clickable {
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            isShiftActive = false
                             onToggleLanguage()
                         }
                         .testTag("keyboard_language_toggle")
@@ -406,176 +410,6 @@ fun KeyboardInputSheet(
                         LanguageChipSegment(label = "영", selected = !isKorean)
                         LanguageChipSegment(label = "한", selected = isKorean)
                     }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            fun pressKeySpec(spec: PhysicalKeySpec) {
-                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                val shiftNow = isShiftActive
-                onPhysicalKeyPress(spec, shiftNow)
-                if (shiftNow && spec.supportsShift) {
-                    isShiftActive = false
-                }
-            }
-
-            // Row 1: Numbers 1..0
-            Column(
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("physical_keypad_grid")
-            ) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    TvImeKeycodeMap.numberRow.forEach { spec ->
-                        PhysicalKeyCap(
-                            label = spec.labelFor(keyboardLanguage, shifted = false),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("phys_key_${spec.id}"),
-                            onClick = { pressKeySpec(spec) }
-                        )
-                    }
-                }
-
-                // Row 2: QWERTY / ㅂ..ㅔ
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    TvImeKeycodeMap.topRow.forEach { spec ->
-                        PhysicalKeyCap(
-                            label = spec.labelFor(keyboardLanguage, shifted = isShiftActive),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("phys_key_${spec.id}"),
-                            onClick = { pressKeySpec(spec) }
-                        )
-                    }
-                }
-
-                // Row 3: ASDF..L / ㅁ..ㅣ
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Spacer(modifier = Modifier.weight(0.45f))
-                    TvImeKeycodeMap.homeRow.forEach { spec ->
-                        PhysicalKeyCap(
-                            label = spec.labelFor(keyboardLanguage, shifted = isShiftActive),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("phys_key_${spec.id}"),
-                            onClick = { pressKeySpec(spec) }
-                        )
-                    }
-                    Spacer(modifier = Modifier.weight(0.45f))
-                }
-
-                // Row 4: Shift + Z..M / ㅋ..ㅡ + Backspace
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    PhysicalIconKeyCap(
-                        icon = Icons.Rounded.KeyboardCapslock,
-                        contentDescription = "Shift",
-                        containerColor = if (isShiftActive) MintGreen else CharcoalSurfaceElevated,
-                        contentColor = if (isShiftActive) OnMintGreen else TextPrimary,
-                        modifier = Modifier
-                            .weight(1.45f)
-                            .testTag("phys_key_shift"),
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            isShiftActive = !isShiftActive
-                        }
-                    )
-                    TvImeKeycodeMap.bottomRow.forEach { spec ->
-                        PhysicalKeyCap(
-                            label = spec.labelFor(keyboardLanguage, shifted = isShiftActive),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("phys_key_${spec.id}"),
-                            onClick = { pressKeySpec(spec) }
-                        )
-                    }
-                    PhysicalIconKeyCap(
-                        icon = Icons.AutoMirrored.Rounded.Backspace,
-                        contentDescription = "지우기",
-                        containerColor = CharcoalSurfaceElevated,
-                        contentColor = TextPrimary,
-                        modifier = Modifier
-                            .weight(1.45f)
-                            .testTag("phys_key_backspace"),
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onBackspace(1)
-                        }
-                    )
-                }
-
-                // Row 5: 한/영 | , | Space | . | Enter
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    val isKorean = keyboardLanguage == TvKeyboardLanguage.KOREAN
-                    PhysicalKeyCap(
-                        label = "한/영",
-                        containerColor = if (isKorean) MintGreenContainer else CharcoalSurfaceElevated,
-                        contentColor = if (isKorean) MintGreen else TextPrimary,
-                        modifier = Modifier
-                            .weight(1.8f)
-                            .testTag("phys_key_lang_switch"),
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            isShiftActive = false
-                            onToggleLanguage()
-                        }
-                    )
-                    PhysicalKeyCap(
-                        label = ",",
-                        modifier = Modifier
-                            .weight(0.9f)
-                            .testTag("phys_key_comma"),
-                        onClick = { pressKeySpec(TvImeKeycodeMap.commaSpec) }
-                    )
-                    PhysicalKeyCap(
-                        label = "Space",
-                        containerColor = CharcoalSurface,
-                        contentColor = TextSecondary,
-                        modifier = Modifier
-                            .weight(3.8f)
-                            .testTag("phys_key_space"),
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onSendKey(TvKeyCodes.SPACE)
-                        }
-                    )
-                    PhysicalKeyCap(
-                        label = ".",
-                        modifier = Modifier
-                            .weight(0.9f)
-                            .testTag("phys_key_period"),
-                        onClick = { pressKeySpec(TvImeKeycodeMap.periodSpec) }
-                    )
-                    PhysicalIconKeyCap(
-                        icon = Icons.AutoMirrored.Rounded.KeyboardReturn,
-                        contentDescription = "Enter",
-                        containerColor = MintGreen,
-                        contentColor = OnMintGreen,
-                        modifier = Modifier
-                            .weight(1.8f)
-                            .testTag("phys_key_enter"),
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onSendKey(TvKeyCodes.ENTER)
-                        }
-                    )
                 }
             }
         }
@@ -600,101 +434,5 @@ private fun LanguageChipSegment(
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
             color = if (selected) OnMintGreen else TextSecondary
         )
-    }
-}
-
-@Composable
-private fun PhysicalKeyCap(
-    label: String,
-    modifier: Modifier = Modifier,
-    containerColor: Color = CharcoalSurface,
-    contentColor: Color = TextPrimary,
-    onClick: () -> Unit
-) {
-    val shape = RoundedCornerShape(9.dp)
-    Surface(
-        color = containerColor,
-        shape = shape,
-        modifier = modifier
-            .height(38.dp)
-            .clip(shape)
-            .border(1.dp, CharcoalBorder, shape)
-            .clickable(onClick = onClick)
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = label,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = contentColor,
-                maxLines = 1,
-                softWrap = false
-            )
-        }
-    }
-}
-
-@Composable
-private fun PhysicalIconKeyCap(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    contentDescription: String,
-    containerColor: Color,
-    contentColor: Color,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    val shape = RoundedCornerShape(9.dp)
-    Surface(
-        color = containerColor,
-        shape = shape,
-        modifier = modifier
-            .height(38.dp)
-            .clip(shape)
-            .border(1.dp, CharcoalBorder, shape)
-            .clickable(onClick = onClick)
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Icon(
-                imageVector = icon,
-                contentDescription = contentDescription,
-                tint = contentColor,
-                modifier = Modifier.size(18.dp)
-            )
-        }
-    }
-}
-
-/**
- * Returns the number of characters removed by a pure Backspace/deletion edit,
- * returning 0 for text insertions or Korean Hangul IME syllable composition transitions.
- */
-internal fun computeRealTimeBackspaceCount(
-    previous: TextFieldValue,
-    next: TextFieldValue
-): Int {
-    val prevText = previous.text
-    val nextText = next.text
-    if (nextText.length >= prevText.length) return 0
-
-    if (!previous.selection.collapsed) {
-        val start = previous.selection.min.coerceIn(0, prevText.length)
-        val end = previous.selection.max.coerceIn(start, prevText.length)
-        val afterDelete = prevText.removeRange(start, end)
-        return if (afterDelete == nextText) {
-            Character.codePointCount(prevText, start, end).coerceAtLeast(0)
-        } else {
-            0
-        }
-    }
-
-    val prefixLen = prevText.commonPrefixWith(nextText).length
-    val prevRemaining = prevText.substring(prefixLen)
-    val nextRemaining = nextText.substring(prefixLen)
-    val suffixLen = prevRemaining.commonSuffixWith(nextRemaining).length
-    return if (prefixLen + suffixLen == nextText.length) {
-        val deleteEnd = (prevText.length - suffixLen).coerceAtLeast(prefixLen)
-        Character.codePointCount(prevText, prefixLen, deleteEnd).coerceAtLeast(0)
-    } else {
-        0
     }
 }

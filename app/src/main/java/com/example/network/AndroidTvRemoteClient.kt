@@ -31,6 +31,7 @@ class AndroidTvRemoteClient(
     private val onVoiceBeginRequested: (sessionId: Int, packageName: String?) -> Unit = { _, _ -> },
     private val onVoiceEndRequested: (sessionId: Int) -> Unit = { _ -> },
     private val onRemoteError: (code: Int, detail: String?) -> Unit = { _, _ -> },
+    private val onRemoteErrorInfo: (RemoteErrorInfo) -> Unit = {},
     private val onDisconnected: (Throwable?) -> Unit
 ) {
 
@@ -73,6 +74,13 @@ class AndroidTvRemoteClient(
 
     @Volatile
     private var currentForegroundPackage: String? = null
+
+    @Volatile
+    var tvFeatures: Int? = null
+        private set
+
+    val isVoiceSupportedByTv: Boolean?
+        get() = isVoiceFeatureSupported(tvFeatures)
 
     @Volatile
     var isImeFieldActive: Boolean = false
@@ -125,11 +133,13 @@ class AndroidTvRemoteClient(
         output = sslSocket.outputStream
         val input = sslSocket.inputStream
 
-        // Perform initial RemoteConfigure handshake (include PING|KEY|IME|POWER|VOLUME|APP_LINK)
+        // Perform initial RemoteConfigure handshake (include PING|KEY|IME|VOICE|POWER|VOLUME|APP_LINK)
         val serverConfigFrame = ProtobufWire.readFramedMessage(input)
         val serverFields = ProtobufWire.parseFields(serverConfigFrame)
-        if (serverFields.none { it.number == 1 }) {
-            throw IllegalStateException("TV에서 페어링 인증이 필요합니다.")
+        val serverConfigField = serverFields.firstOrNull { it.number == 1 && it.wireType == 2 }
+            ?: throw IllegalStateException("TV에서 페어링 인증이 필요합니다.")
+        parseRemoteConfigureFeatures(serverConfigField.asMessage())?.let { features ->
+            tvFeatures = features
         }
 
         val configurePayload = ProtobufWire.encode {
@@ -186,6 +196,11 @@ class AndroidTvRemoteClient(
     private suspend fun handleIncomingFields(fields: List<ProtobufWire.Field>) {
         for (field in fields) {
             when (field.number) {
+                1 -> { // remote_configure
+                    parseRemoteConfigureFeatures(field.asMessage())?.let { features ->
+                        tvFeatures = features
+                    }
+                }
                 2 -> { // remote_set_active
                     val activeReply = ProtobufWire.encode {
                         writeMessageField(2) {
@@ -195,15 +210,9 @@ class AndroidTvRemoteClient(
                     sendRaw(activeReply)
                 }
                 3 -> { // remote_error
-                    val errFields = field.asMessage()
-                    val code = errFields.firstOrNull { it.number == 1 }?.varint?.toInt() ?: -1
-                    val detail = errFields.firstOrNull { it.number == 2 }?.bytes?.let {
-                        runCatching {
-                            val nested = ProtobufWire.parseFields(it)
-                            nested.firstOrNull { f -> f.number == 1 || f.number == 2 }?.asString()
-                        }.getOrNull() ?: it.toString(Charsets.UTF_8)
-                    }
-                    onRemoteError(code, detail)
+                    val errInfo = parseRemoteError(field.asMessage())
+                    onRemoteError(if (errInfo.value) 1 else 0, errInfo.detail)
+                    onRemoteErrorInfo(errInfo)
                 }
                 8 -> { // remote_ping_request
                     val pingFields = field.asMessage()
@@ -324,6 +333,7 @@ class AndroidTvRemoteClient(
         isImeFieldActive = false
         lastImeAppPackage = null
         currentForegroundPackage = null
+        tvFeatures = null
     }
 
     internal fun resolvedImeFieldCounter(): Int = fieldCounter
@@ -413,7 +423,22 @@ class AndroidTvRemoteClient(
 
     suspend fun sendVoicePayload(sessionId: Int, pcmSamples: ByteArray) {
         if (pcmSamples.isEmpty()) return
-        sendRaw(buildVoicePayload(sessionId, pcmSamples))
+        if (pcmSamples.size <= TvVoiceStreamer.MAX_PAYLOAD_BYTES) {
+            sendRaw(buildVoicePayload(sessionId, pcmSamples))
+            return
+        }
+        var offset = 0
+        while (offset < pcmSamples.size) {
+            val remaining = pcmSamples.size - offset
+            val rawTake = when {
+                remaining <= TvVoiceStreamer.MAX_PAYLOAD_BYTES -> remaining
+                remaining - TvVoiceStreamer.MAX_PAYLOAD_BYTES >= TvVoiceStreamer.MIN_PAYLOAD_BYTES -> TvVoiceStreamer.MAX_PAYLOAD_BYTES
+                else -> (remaining - TvVoiceStreamer.MIN_PAYLOAD_BYTES) and 1.inv()
+            }
+            val take = if (rawTake > 0) rawTake else minOf(remaining, TvVoiceStreamer.MAX_PAYLOAD_BYTES)
+            sendRaw(buildVoicePayload(sessionId, pcmSamples.copyOfRange(offset, offset + take)))
+            offset += take
+        }
     }
 
     suspend fun sendVoiceEnd(sessionId: Int) {
@@ -517,7 +542,7 @@ class AndroidTvRemoteClient(
     suspend fun selectAllAndDelete() {
         imeMutex.withLock {
             sendKeyWithModifiersLocked(keyCode = TvKeyCodes.KEYCODE_A, ctrl = true)
-            kotlinx.coroutines.delay(60)
+            kotlinx.coroutines.delay(80)
             sendKey(TvKeyCodes.DEL, DIRECTION_SHORT)
             trackedTvText = ""
             trackedSelStart = 0
@@ -541,7 +566,9 @@ class AndroidTvRemoteClient(
             sendKey(mod, DIRECTION_START_LONG)
         }
         kotlinx.coroutines.delay(25)
-        sendKey(keyCode, DIRECTION_SHORT)
+        sendKey(keyCode, DIRECTION_START_LONG)
+        kotlinx.coroutines.delay(25)
+        sendKey(keyCode, DIRECTION_END_LONG)
         kotlinx.coroutines.delay(25)
         for (mod in heldModifiers.asReversed()) {
             sendKey(mod, DIRECTION_END_LONG)
@@ -579,11 +606,55 @@ class AndroidTvRemoteClient(
         }
     }
 
+    data class RemoteErrorInfo(
+        val value: Boolean,
+        val offendingFieldNumber: Int?,
+        val detail: String
+    )
+
     companion object {
         const val DIRECTION_START_LONG = 1
         const val DIRECTION_END_LONG = 2
         const val DIRECTION_SHORT = 3
-        const val REMOTE_FEATURES = 639 // PING(1)|KEY(2)|IME(4)|POWER(8)|VOICE(16)|VOLUME(32)|64|APP_LINK(512)
+        const val FEATURE_PING = 1
+        const val FEATURE_KEY = 2
+        const val FEATURE_IME = 4
+        const val FEATURE_VOICE = 8
+        const val FEATURE_POWER = 32
+        const val FEATURE_VOLUME = 64
+        const val FEATURE_APP_LINK = 512
+        const val REMOTE_FEATURES = 639 // PING(1)|KEY(2)|IME(4)|VOICE(8)|LEGACY(16)|POWER(32)|VOLUME(64)|APP_LINK(512)
+
+
+        fun parseRemoteConfigureFeatures(configFields: List<ProtobufWire.Field>): Int? =
+            configFields.firstOrNull { it.number == 1 && it.wireType == 0 }?.varint?.toInt()
+
+        fun isVoiceFeatureSupported(features: Int?): Boolean? {
+            if (features == null || features == 0) return null
+            return (features and FEATURE_VOICE) != 0
+        }
+
+        fun parseRemoteError(errFields: List<ProtobufWire.Field>): RemoteErrorInfo {
+            val value = (errFields.firstOrNull { it.number == 1 && it.wireType == 0 }?.varint ?: 1L) != 0L
+            val messageField = errFields.firstOrNull { it.number == 2 && it.wireType == 2 }
+            val nestedFields = messageField?.bytes?.let { bytes ->
+                runCatching { ProtobufWire.parseFields(bytes) }.getOrNull()
+            }.orEmpty()
+            val offendingFieldNumber = nestedFields.firstOrNull { it.number > 0 }?.number
+            val detail = when (offendingFieldNumber) {
+                30, 31, 32 -> "TV가 음성 입력 패킷(field=$offendingFieldNumber)을 거부했습니다."
+                21 -> "TV가 텍스트 입력 패킷(field=21)을 처리하지 못했습니다."
+                10 -> "TV가 키 입력 명령(field=10)을 거부했습니다."
+                90 -> "TV가 앱 실행 요청(field=90)을 거부했습니다."
+                null -> "TV 원격 제어 오류 (value=${if (value) 1 else 0})"
+                else -> "TV 프로토콜 오류 (message field=$offendingFieldNumber)"
+            }
+            return RemoteErrorInfo(
+                value = value,
+                offendingFieldNumber = offendingFieldNumber,
+                detail = detail
+            )
+        }
 
         fun parseVolumeLevel(volFields: List<ProtobufWire.Field>): Triple<Int, Int, Boolean> {
             val max = (volFields.firstOrNull { it.number == 6 }?.varint?.toInt() ?: 100).coerceAtLeast(1)

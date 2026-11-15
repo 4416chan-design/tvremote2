@@ -751,16 +751,17 @@ class NetworkAdbClient(
 
         fun buildSelectAllAndDeleteShellCommand(): String = buildString {
             append("OUT=\$(input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A} 2>&1); ")
-            append("if echo \"\$OUT\" | grep -qiE \"Error:|Unknown|Exception\"; then ")
-            append("${buildClearKeyEventsPrefix(20)} 2>&1; ")
+            append("RC=\$?; ")
+            append("if [ \"\$RC\" -ne 0 ] || echo \"\$OUT\" | grep -qiE \"Error|Unknown|Usage|Invalid|Exception\"; then ")
+            append("${buildClearKeyEventsPrefix(30)} 2>&1; ")
             append("else ")
-            append("sleep 0.08; ")
+            append("sleep 0.1; ")
             append("input keyevent ${TvKeyCodes.DEL} 2>&1; ")
             append("fi")
         }
 
         fun buildClearKeyEventsPrefix(clearCount: Int): String {
-            val safeCount = clearCount.coerceIn(0, 30)
+            val safeCount = clearCount.coerceIn(0, 40)
             if (safeCount <= 0) return ""
             val dels = List(safeCount) { "67" }.joinToString(" ")
             return "input keyevent 123 $dels"

@@ -78,14 +78,23 @@ object TvKeyCodes {
     const val KEYCODE_Y = 53
     const val KEYCODE_Z = 54
 
+    const val STAR = 17
+    const val POUND = 18
     const val COMMA = 55
     const val PERIOD = 56
     const val SHIFT_LEFT = 59
     const val SHIFT_RIGHT = 60
+    const val GRAVE = 68
     const val MINUS = 69
     const val EQUALS = 70
+    const val LEFT_BRACKET = 71
+    const val RIGHT_BRACKET = 72
+    const val BACKSLASH = 73
+    const val SEMICOLON = 74
+    const val APOSTROPHE = 75
     const val SLASH = 76
     const val AT = 77
+    const val PLUS = 81
     const val CTRL_LEFT = 113
     const val MOVE_HOME = 122
     const val MOVE_END = 123

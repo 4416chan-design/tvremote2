@@ -111,8 +111,9 @@ class MainActivity : ComponentActivity() {
 
                 fun launchSpeechRecognizerFallback() {
                     if (speechRecognizer == null) {
-                        viewModel.setVoiceListening(false)
-                        viewModel.showMessage("TV 음성 스트리밍 응답이 없고 기기 음성 인식기도 사용할 수 없습니다.")
+                        viewModel.onVoiceFallbackFinished(
+                            "TV 음성 스트리밍 응답이 없고 기기 음성 인식기도 사용할 수 없습니다."
+                        )
                         return
                     }
                     val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -124,8 +125,7 @@ class MainActivity : ComponentActivity() {
                     viewModel.setVoiceListening(true)
                     runCatching { speechRecognizer.startListening(intent) }
                         .onFailure {
-                            viewModel.setVoiceListening(false)
-                            viewModel.showMessage("음성 인식을 시작할 수 없습니다: ${it.message}")
+                            viewModel.onVoiceFallbackFinished("음성 인식을 시작할 수 없습니다: ${it.message}")
                         }
                 }
 
@@ -147,7 +147,6 @@ class MainActivity : ComponentActivity() {
                             viewModel.setVoiceListening(false)
                         }
                         override fun onError(error: Int) {
-                            viewModel.setVoiceListening(false)
                             val msg = when (error) {
                                 SpeechRecognizer.ERROR_NO_MATCH,
                                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "음성을 인식하지 못했습니다. 다시 시도해 주세요."
@@ -158,7 +157,7 @@ class MainActivity : ComponentActivity() {
                                 SpeechRecognizer.ERROR_SERVER -> "음성 인식 서버 연결 오류입니다."
                                 else -> "음성 인식 실패 (코드: $error)"
                             }
-                            viewModel.showMessage(msg)
+                            viewModel.onVoiceFallbackFinished(msg)
                         }
                         override fun onResults(results: Bundle?) {
                             viewModel.setVoiceListening(false)
@@ -182,8 +181,7 @@ class MainActivity : ComponentActivity() {
                     if (granted) {
                         viewModel.startVoiceSession()
                     } else {
-                        viewModel.showMessage("마이크 권한이 거부되어 TV 음성 어시스턴트 키만 전송합니다.")
-                        viewModel.sendKey(com.example.data.model.TvKeyCodes.VOICE_ASSIST)
+                        viewModel.triggerTvVoiceAssistWithoutMic()
                     }
                 }
 
@@ -200,7 +198,7 @@ class MainActivity : ComponentActivity() {
                     if (hasAudioPermission) {
                         if (isVoiceListening) {
                             viewModel.stopVoiceSession(sendEndPacket = true)
-                            speechRecognizer?.stopListening()
+                            runCatching { speechRecognizer?.stopListening() }
                         } else {
                             viewModel.startVoiceSession()
                         }
@@ -303,7 +301,7 @@ class MainActivity : ComponentActivity() {
                         tvImeStatus = tvImeStatus,
                         onToggleLanguage = viewModel::toggleKeyboardLanguage,
                         onResyncTvIme = viewModel::resyncTvImeLanguage,
-                        onPhysicalKeyPress = viewModel::sendPhysicalKey,
+                        onRealTimeKeyEdit = viewModel::sendRealTimeKeyboardEdit,
                         onClearAll = viewModel::clearKeyboardWithSelectAllDelete,
                         onSendText = viewModel::sendKeyboardText,
                         onBackspace = viewModel::sendKeyboardBackspace,
