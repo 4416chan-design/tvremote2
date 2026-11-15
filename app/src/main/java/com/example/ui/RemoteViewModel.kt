@@ -1187,11 +1187,11 @@ class RemoteViewModel(
 
         if (remoteClient.isConnected) {
             val edit = TvImeKeycodeMap.computeRealTimeEditActions(
-                previousText = "",
-                previousSelectionStart = 0,
-                previousSelectionEnd = 0,
-                newText = pending.text,
-                imeType = _tvImeStatus.value.imeType
+                "",
+                0,
+                0,
+                pending.text,
+                _tvImeStatus.value.imeType
             )
             if (edit.keyActions.isNotEmpty()) {
                 var allSent = true
