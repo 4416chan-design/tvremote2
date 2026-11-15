@@ -11,6 +11,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
@@ -47,6 +48,7 @@ class KeyboardInputSheetRobolectricTest {
         var clearAllCalls = 0
         var resyncCalls = 0
         var toggleCalls = 0
+        var dismissCalls = 0
 
         composeRule.setContent {
             var language by remember { mutableStateOf(TvKeyboardLanguage.KOREAN) }
@@ -81,7 +83,7 @@ class KeyboardInputSheetRobolectricTest {
                     },
                     onSendKey = { key -> sentKeys.add(key) },
                     onBackspace = { count -> backspaceCalls.add(count) },
-                    onDismiss = {}
+                    onDismiss = { dismissCalls++ }
                 )
             }
         }
@@ -114,10 +116,11 @@ class KeyboardInputSheetRobolectricTest {
         assertEquals(listOf(1), backspaceCalls)
         assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
 
-        // Pressing Send even when empty clears -> inputs nothing -> sends ENTER
+        // Pressing Send even when empty clears -> inputs nothing -> sends ENTER -> requests dismiss
         composeRule.onNodeWithTag("keyboard_send_search_button").performScrollTo().performClick()
         assertEquals(listOf(Triple("", true, true)), sentTexts)
         assertEquals(emptyList<Int>(), sentKeys)
+        assertEquals(1, dismissCalls)
 
         // Typing Q, W, E, R via phone keyboard streams real-time keycodes immediately
         sentTexts.clear()
@@ -168,10 +171,99 @@ class KeyboardInputSheetRobolectricTest {
         composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("하")
         assertEquals(listOf(1), backspaceCalls)
 
-        // Send button still submits full replacement + ENTER
+        // Send button still submits full replacement + ENTER + dismiss
         sentTexts.clear()
         composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("유튜브 검색")
         composeRule.onNodeWithTag("keyboard_send_search_button").performScrollTo().performClick()
         assertEquals(listOf(Triple("유튜브 검색", true, true)), sentTexts)
+        assertEquals(2, dismissCalls)
+    }
+
+    @Test
+    fun `clicking send and IME send both hide software keyboard and close bottom sheet`() {
+        val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
+        var hideKeyboardCalls = 0
+        var sheetVisibleState = true
+        val fakeKeyboardController = object : androidx.compose.ui.platform.SoftwareKeyboardController {
+            override fun show() = Unit
+            override fun hide() {
+                hideKeyboardCalls++
+            }
+        }
+
+        composeRule.setContent {
+            var visible by remember { mutableStateOf(true) }
+            sheetVisibleState = visible
+            androidx.compose.runtime.CompositionLocalProvider(
+                androidx.compose.ui.platform.LocalSoftwareKeyboardController provides fakeKeyboardController
+            ) {
+                TvRemoteTheme {
+                    if (visible) {
+                        KeyboardInputSheet(
+                            tvName = "Living Room TV",
+                            initialText = "",
+                            onSendText = { text, replaceExisting, submitWithEnter ->
+                                sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
+                            },
+                            onSendKey = {},
+                            onDismiss = { visible = false }
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("넷플릭스")
+        composeRule.onNodeWithTag("keyboard_send_search_button").performScrollTo().performClick()
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(Triple("넷플릭스", true, true)), sentTexts)
+        assertEquals(false, sheetVisibleState)
+        org.junit.Assert.assertTrue("SoftwareKeyboardController.hide() must run", hideKeyboardCalls >= 1)
+        composeRule.onNodeWithTag("tv_keyboard_input_field").assertDoesNotExist()
+    }
+
+    @Test
+    fun `pressing IME send action also hides software keyboard and closes bottom sheet`() {
+        val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
+        var hideKeyboardCalls = 0
+        var sheetVisibleState = true
+        val fakeKeyboardController = object : androidx.compose.ui.platform.SoftwareKeyboardController {
+            override fun show() = Unit
+            override fun hide() {
+                hideKeyboardCalls++
+            }
+        }
+
+        composeRule.setContent {
+            var visible by remember { mutableStateOf(true) }
+            sheetVisibleState = visible
+            androidx.compose.runtime.CompositionLocalProvider(
+                androidx.compose.ui.platform.LocalSoftwareKeyboardController provides fakeKeyboardController
+            ) {
+                TvRemoteTheme {
+                    if (visible) {
+                        KeyboardInputSheet(
+                            tvName = "Living Room TV",
+                            initialText = "",
+                            onSendText = { text, replaceExisting, submitWithEnter ->
+                                sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
+                            },
+                            onSendKey = {},
+                            onDismiss = { visible = false }
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("디즈니")
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performImeAction()
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(Triple("디즈니", true, true)), sentTexts)
+        assertEquals(false, sheetVisibleState)
+        org.junit.Assert.assertTrue("SoftwareKeyboardController.hide() must run", hideKeyboardCalls >= 1)
+        composeRule.onNodeWithTag("tv_keyboard_input_field").assertDoesNotExist()
     }
 }

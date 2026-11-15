@@ -32,6 +32,7 @@ object TvKeyCodes {
     const val GUIDE = 172
     const val BRIGHTNESS_DOWN = 220
     const val BRIGHTNESS_UP = 221
+    const val ASSIST = 219
     const val VOICE_ASSIST = 231
     const val ALL_APPS = 284
     const val SLEEP = 223

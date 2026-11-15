@@ -447,6 +447,46 @@ class NetworkAdbClient(
     }
 
     /**
+     * Launches Google Assistant on the TV via ACTION_ASSIST intent, falling back to
+     * KEYCODE_VOICE_ASSIST (231) or KEYCODE_ASSIST (219) over ADB shell.
+     */
+    suspend fun triggerGoogleAssistant(): Result<Unit> {
+        if (!isConnected) {
+            return Result.failure(IllegalStateException("ADB 미연결"))
+        }
+        val res = shell(buildGoogleAssistantLaunchShellCommand(), timeoutMs = 5_000L)
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("구글 어시스턴트 실행 실패"))
+        }
+        val out = res.getOrDefault("")
+        if (out.contains("Error:", ignoreCase = true) || out.contains("Exception", ignoreCase = true)) {
+            return Result.failure(IllegalStateException(out))
+        }
+        return Result.success(Unit)
+    }
+
+    /**
+     * Submits a recognized search/assistant query to Android TV global search / Katniss
+     * without requiring a focused IME field. Supports UTF-8 Korean and English queries.
+     */
+    suspend fun submitGoogleAssistantQuery(query: String): Result<Unit> {
+        if (!isConnected) {
+            return Result.failure(IllegalStateException("ADB 미연결"))
+        }
+        val cmd = buildGoogleAssistantQueryShellCommand(query)
+            ?: return Result.failure(IllegalArgumentException("검색어가 비어 있습니다."))
+        val res = shell(cmd, timeoutMs = 5_000L)
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("음성 검색 인텐트 전송 실패"))
+        }
+        val out = res.getOrDefault("")
+        if (out.contains("Error:", ignoreCase = true) || out.contains("Exception", ignoreCase = true)) {
+            return Result.failure(IllegalStateException(out))
+        }
+        return Result.success(Unit)
+    }
+
+    /**
      * Reads the active Android TV IME ID and Korean/English subtype language via ADB shell.
      */
     suspend fun readTvImeStatus(): Result<TvImeStatus> {
@@ -815,6 +855,27 @@ class NetworkAdbClient(
         fun buildKeyEventShellCommand(keyCode: Int): String? {
             if (keyCode <= 0) return null
             return "input keyevent $keyCode 2>&1"
+        }
+
+        fun buildGoogleAssistantLaunchShellCommand(): String = buildString {
+            append("OUT=\$(am start -a android.intent.action.ASSIST 2>&1); ")
+            append("RC=\$?; ")
+            append("if [ \"\$RC\" -ne 0 ] || echo \"\$OUT\" | grep -qiE \"Error:|Exception|unable to resolve|No Activity\"; then ")
+            append("input keyevent ${TvKeyCodes.VOICE_ASSIST} 2>&1 || input keyevent ${TvKeyCodes.ASSIST} 2>&1; ")
+            append("fi")
+        }
+
+        fun buildGoogleAssistantQueryShellCommand(query: String): String? {
+            val sanitized = query.replace('\r', ' ').replace('\n', ' ').replace("\u0000", "").trim()
+            if (sanitized.isEmpty()) return null
+            val escaped = escapeSingleQuotedShellArg(sanitized)
+            return buildString {
+                append("OUT=\$(am start -a android.search.action.GLOBAL_SEARCH --es query '$escaped' 2>&1); ")
+                append("RC=\$?; ")
+                append("if [ \"\$RC\" -ne 0 ] || echo \"\$OUT\" | grep -qiE \"Error:|Exception|unable to resolve|No Activity\"; then ")
+                append("am start -a android.intent.action.SEARCH --es query '$escaped' 2>&1; ")
+                append("fi")
+            }
         }
 
         fun buildAppLaunchShellCommand(packageName: String, fallbackUri: String? = null): String? {

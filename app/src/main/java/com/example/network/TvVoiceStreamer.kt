@@ -305,7 +305,8 @@ class TvVoiceStreamer internal constructor(
     fun startCapture(
         scope: CoroutineScope,
         onChunk: suspend (sessionId: Int, chunk: ByteArray) -> Unit,
-        onCaptureFailed: (Throwable) -> Unit
+        onCaptureFailed: (Throwable) -> Unit,
+        onSpeechDetected: () -> Unit = {}
     ) {
         stop()
         val prevReleasingJob = cancelingJob
@@ -330,6 +331,9 @@ class TvVoiceStreamer internal constructor(
                     isRunning = { isCapturing }
                 ) { frame ->
                     if (!isCapturing) return@captureFrames
+                    if (computePcm16PeakAmplitude(frame) >= SPEECH_PEAK_THRESHOLD) {
+                        onSpeechDetected()
+                    }
                     pipeline.pushFrame(generation, frame, onChunk)
                 }
             } catch (t: Throwable) {
@@ -416,7 +420,25 @@ class TvVoiceStreamer internal constructor(
         const val CHUNK_BYTES = 1600
         const val MIN_PAYLOAD_BYTES = VoiceChunkAccumulator.MIN_PAYLOAD_BYTES
         const val MAX_PAYLOAD_BYTES = VoiceChunkAccumulator.MAX_PAYLOAD_BYTES
+        internal const val SPEECH_PEAK_THRESHOLD = 600
         private const val FINISH_JOIN_TIMEOUT_MS = 450L
+
+        internal fun computePcm16PeakAmplitude(pcmLeBytes: ByteArray): Int {
+            var peak = 0
+            var i = 0
+            val limit = pcmLeBytes.size and 1.inv()
+            while (i < limit) {
+                val lo = pcmLeBytes[i].toInt() and 0xFF
+                val hi = pcmLeBytes[i + 1].toInt()
+                val sample = (hi shl 8) or lo
+                val abs = kotlin.math.abs(sample)
+                if (abs > peak) {
+                    peak = abs
+                }
+                i += 2
+            }
+            return peak
+        }
 
         private fun createHardwareCaptureBackend(): VoiceAudioCaptureBackend =
             VoiceAudioCaptureBackend { frameBytes, isRunning, onFrame ->

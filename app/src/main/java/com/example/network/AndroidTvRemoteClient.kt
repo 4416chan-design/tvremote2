@@ -29,7 +29,9 @@ class AndroidTvRemoteClient(
     private val onImeHidden: () -> Unit = {},
     private val onVolumeChanged: (level: Int, max: Int, muted: Boolean) -> Unit,
     private val onVoiceBeginRequested: (sessionId: Int, packageName: String?) -> Unit = { _, _ -> },
+    private val onVoicePayloadAck: (sessionId: Int) -> Unit = { _ -> },
     private val onVoiceEndRequested: (sessionId: Int) -> Unit = { _ -> },
+    private val onTvStartChanged: (started: Boolean) -> Unit = { _ -> },
     private val onRemoteError: (code: Int, detail: String?) -> Unit = { _, _ -> },
     private val onRemoteErrorInfo: (RemoteErrorInfo) -> Unit = {},
     private val onDisconnected: (Throwable?) -> Unit
@@ -144,7 +146,7 @@ class AndroidTvRemoteClient(
 
         val configurePayload = ProtobufWire.encode {
             writeMessageField(1) { // remote_configure
-                writeVarintField(1, REMOTE_FEATURES)
+                writeVarintField(1, computeNegotiatedFeatures(tvFeatures))
                 writeMessageField(2) { // device_info
                     writeStringField(1, Build.MODEL ?: "Android")
                     writeStringField(2, Build.MANUFACTURER ?: "Google")
@@ -204,7 +206,7 @@ class AndroidTvRemoteClient(
                 2 -> { // remote_set_active
                     val activeReply = ProtobufWire.encode {
                         writeMessageField(2) {
-                            writeVarintField(1, REMOTE_FEATURES)
+                            writeVarintField(1, computeNegotiatedFeatures(tvFeatures))
                         }
                     }
                     sendRaw(activeReply)
@@ -289,9 +291,17 @@ class AndroidTvRemoteClient(
                     val (sessionId, pkg) = parseVoiceBegin(field.asMessage())
                     onVoiceBeginRequested(sessionId, pkg)
                 }
+                31 -> { // remote_voice_payload (TV signals end-of-speech marker or voice payload ack)
+                    val sessionId = field.asMessage().firstOrNull { it.number == 1 }?.varint?.toInt() ?: 0
+                    onVoicePayloadAck(sessionId)
+                }
                 32 -> { // remote_voice_end (TV signals end of voice session)
                     val sessionId = field.asMessage().firstOrNull { it.number == 1 }?.varint?.toInt() ?: 0
                     onVoiceEndRequested(sessionId)
+                }
+                40 -> { // remote_start (TV power / active state changed)
+                    val started = (field.asMessage().firstOrNull { it.number == 1 }?.varint ?: 0L) != 0L
+                    onTvStartChanged(started)
                 }
                 50 -> { // remote_set_volume_level (6=volume_max, 7=volume_level, 8=volume_muted)
                     val (level, max, muted) = parseVolumeLevel(field.asMessage())
@@ -632,6 +642,13 @@ class AndroidTvRemoteClient(
         fun isVoiceFeatureSupported(features: Int?): Boolean? {
             if (features == null || features == 0) return null
             return (features and FEATURE_VOICE) != 0
+        }
+
+        fun computeNegotiatedFeatures(tvSupportedFeatures: Int?): Int {
+            if (tvSupportedFeatures == null || tvSupportedFeatures == 0) {
+                return REMOTE_FEATURES
+            }
+            return REMOTE_FEATURES and tvSupportedFeatures
         }
 
         fun parseRemoteError(errFields: List<ProtobufWire.Field>): RemoteErrorInfo {

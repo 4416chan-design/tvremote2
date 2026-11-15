@@ -1220,4 +1220,85 @@ class ProtobufAndCertUnitTest {
         assertEquals(16808, p0.first { it.number == 2 }.bytes.size)
         assertEquals(8192, p1.first { it.number == 2 }.bytes.size)
     }
+
+    @Test
+    fun `remote client negotiates supported features intersects bitmask and emits voice ack and start callbacks`() {
+        assertEquals(639, AndroidTvRemoteClient.computeNegotiatedFeatures(null))
+        assertEquals(639, AndroidTvRemoteClient.computeNegotiatedFeatures(0))
+        assertEquals(623, AndroidTvRemoteClient.computeNegotiatedFeatures(623))
+        assertEquals(615, AndroidTvRemoteClient.computeNegotiatedFeatures(615))
+
+        val ackedSessions = mutableListOf<Int>()
+        val startStates = mutableListOf<Boolean>()
+        val sentFrames = mutableListOf<ByteArray>()
+        val client = AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = {},
+            onImeShowRequested = { _, _ -> },
+            onVolumeChanged = { _, _, _ -> },
+            onVoicePayloadAck = { ackedSessions.add(it) },
+            onTvStartChanged = { startStates.add(it) },
+            onDisconnected = {}
+        ).apply {
+            testRawBytesSink = { sentFrames.add(it) }
+        }
+
+        val incomingCfg = ProtobufWire.encode {
+            writeMessageField(1) { writeVarintField(1, 615) }
+        }
+        val setActive = ProtobufWire.encode {
+            writeMessageField(2) { writeVarintField(1, 615) }
+        }
+        val voiceAck = ProtobufWire.encode {
+            writeMessageField(31) { writeVarintField(1, 77) }
+        }
+        val remoteStartTrue = ProtobufWire.encode {
+            writeMessageField(40) { writeBoolField(1, true) }
+        }
+        val remoteStartFalse = ProtobufWire.encode {
+            writeMessageField(40) { writeBoolField(1, false) }
+        }
+
+        kotlinx.coroutines.runBlocking {
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(incomingCfg))
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(setActive))
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(voiceAck))
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(remoteStartTrue))
+            client.applyIncomingFieldsForTest(ProtobufWire.parseFields(remoteStartFalse))
+        }
+
+        assertEquals(1, sentFrames.size)
+        val activeReplyMsg = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(sentFrames[0])))
+            .first { it.number == 2 }.asMessage()
+        assertEquals(615L, activeReplyMsg.first { it.number == 1 }.varint)
+        assertEquals(listOf(77), ackedSessions)
+        assertEquals(listOf(true, false), startStates)
+        assertEquals(219, TvKeyCodes.ASSIST)
+    }
+
+    @Test
+    fun `adb assistant launch and global search builders support Korean UTF-8 and sanitize control chars`() {
+        val launchCmd = com.example.network.NetworkAdbClient.buildGoogleAssistantLaunchShellCommand()
+        assertTrue(launchCmd.contains("android.intent.action.ASSIST"))
+        assertTrue(launchCmd.contains("input keyevent ${TvKeyCodes.VOICE_ASSIST}"))
+        assertTrue(launchCmd.contains("input keyevent ${TvKeyCodes.ASSIST}"))
+
+        assertEquals(null, com.example.network.NetworkAdbClient.buildGoogleAssistantQueryShellCommand("  \n\r "))
+        val queryCmd = com.example.network.NetworkAdbClient.buildGoogleAssistantQueryShellCommand("오늘 '날씨'\n알려줘")!!
+        assertTrue(queryCmd.contains("android.search.action.GLOBAL_SEARCH"))
+        assertTrue(queryCmd.contains("android.intent.action.SEARCH"))
+        assertTrue(queryCmd.contains("--es query '오늘 '\\''날씨'\\'' 알려줘'"))
+        assertEquals(false, queryCmd.contains("\n"))
+    }
+
+    @Test
+    fun `voice streamer pcm16 peak amplitude detects silence vs speech safely`() {
+        assertEquals(0, com.example.network.TvVoiceStreamer.computePcm16PeakAmplitude(ByteArray(0)))
+        // 16-bit LE +257 -> below threshold (600)
+        val quiet = byteArrayOf(0x01, 0x01, 0x05) // includes trailing odd byte edge case
+        assertEquals(257, com.example.network.TvVoiceStreamer.computePcm16PeakAmplitude(quiet))
+        // 16-bit LE -32768 -> 32768 >= threshold
+        val loudNeg = byteArrayOf(0x00, 0x80.toByte())
+        assertEquals(32768, com.example.network.TvVoiceStreamer.computePcm16PeakAmplitude(loudNeg))
+    }
 }

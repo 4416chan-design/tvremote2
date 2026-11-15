@@ -1,12 +1,14 @@
 package com.example
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -19,8 +21,13 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -36,6 +43,7 @@ import com.example.ui.components.KeyboardInputSheet
 import com.example.ui.components.PairingPinDialog
 import com.example.ui.components.TvConnectionSheet
 import com.example.ui.theme.TvRemoteTheme
+import kotlinx.coroutines.launch
 
 const val ROUTE_REMOTE = "remote"
 const val ROUTE_SETTINGS = "settings"
@@ -89,6 +97,21 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val focusManager = LocalFocusManager.current
+                val keyboardController = LocalSoftwareKeyboardController.current
+                val localView = LocalView.current
+                var wasKeyboardSheetVisible by remember { mutableStateOf(false) }
+
+                LaunchedEffect(isKeyboardSheetVisible) {
+                    if (wasKeyboardSheetVisible && !isKeyboardSheetVisible) {
+                        focusManager.clearFocus(force = true)
+                        keyboardController?.hide()
+                        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                        imm?.hideSoftInputFromWindow(localView.windowToken, 0)
+                    }
+                    wasKeyboardSheetVisible = isKeyboardSheetVisible
+                }
+
                 LaunchedEffect(snackbarNotice) {
                     val notice = snackbarNotice ?: return@LaunchedEffect
                     val result = snackbarHostState.showSnackbar(
@@ -120,9 +143,9 @@ class MainActivity : ComponentActivity() {
                         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                         putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
                         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     }
-                    viewModel.setVoiceListening(true)
+                    viewModel.onVoiceFallbackStarted()
                     runCatching { speechRecognizer.startListening(intent) }
                         .onFailure {
                             viewModel.onVoiceFallbackFinished("음성 인식을 시작할 수 없습니다: ${it.message}")
@@ -130,8 +153,15 @@ class MainActivity : ComponentActivity() {
                 }
 
                 LaunchedEffect(viewModel) {
-                    viewModel.voiceFallbackRequests.collect {
-                        launchSpeechRecognizerFallback()
+                    launch {
+                        viewModel.voiceFallbackRequests.collect {
+                            launchSpeechRecognizerFallback()
+                        }
+                    }
+                    launch {
+                        viewModel.voiceStopRequests.collect {
+                            runCatching { speechRecognizer?.cancel() }
+                        }
                     }
                 }
 
@@ -140,7 +170,9 @@ class MainActivity : ComponentActivity() {
                         override fun onReadyForSpeech(params: Bundle?) {
                             viewModel.setVoiceListening(true)
                         }
-                        override fun onBeginningOfSpeech() = Unit
+                        override fun onBeginningOfSpeech() {
+                            viewModel.reportVoiceSpeechStarted()
+                        }
                         override fun onRmsChanged(rmsdB: Float) = Unit
                         override fun onBufferReceived(buffer: ByteArray?) = Unit
                         override fun onEndOfSpeech() {
@@ -155,6 +187,7 @@ class MainActivity : ComponentActivity() {
                                 SpeechRecognizer.ERROR_NETWORK,
                                 SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
                                 SpeechRecognizer.ERROR_SERVER -> "음성 인식 서버 연결 오류입니다."
+                                SpeechRecognizer.ERROR_CLIENT -> "음성 인식기를 사용할 수 없습니다."
                                 else -> "음성 인식 실패 (코드: $error)"
                             }
                             viewModel.onVoiceFallbackFinished(msg)
@@ -167,7 +200,15 @@ class MainActivity : ComponentActivity() {
                                 .orEmpty()
                             viewModel.onVoiceSearchRecognized(spoken)
                         }
-                        override fun onPartialResults(partialResults: Bundle?) = Unit
+                        override fun onPartialResults(partialResults: Bundle?) {
+                            val partial = partialResults
+                                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                ?.firstOrNull()
+                                .orEmpty()
+                            if (partial.isNotBlank()) {
+                                viewModel.reportVoiceTextActivity(partial)
+                            }
+                        }
                         override fun onEvent(eventType: Int, params: Bundle?) = Unit
                     })
                     onDispose {
@@ -198,7 +239,6 @@ class MainActivity : ComponentActivity() {
                     if (hasAudioPermission) {
                         if (isVoiceListening) {
                             viewModel.stopVoiceSession(sendEndPacket = true)
-                            runCatching { speechRecognizer?.stopListening() }
                         } else {
                             viewModel.startVoiceSession()
                         }

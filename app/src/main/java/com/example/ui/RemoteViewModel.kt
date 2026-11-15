@@ -39,6 +39,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -147,12 +148,18 @@ class RemoteViewModel(
     private var brightnessSyncJob: Job? = null
     private var voiceSessionJob: Job? = null
     private var voiceFinalizeJob: Job? = null
+    private var voiceFallbackWatchdogJob: Job? = null
     private var lastPictureFallbackNoticeMs: Long = 0L
     private var lastAdbSentTextLength: Int = 0
 
     private val voiceStreamer = TvVoiceStreamer()
     private val voiceFallbackChannel = Channel<Unit>(Channel.BUFFERED)
     val voiceFallbackRequests: Flow<Unit> = voiceFallbackChannel.receiveAsFlow()
+    private val voiceStopChannel = Channel<Unit>(Channel.BUFFERED)
+    val voiceStopRequests: Flow<Unit> = voiceStopChannel.receiveAsFlow()
+
+    @Volatile
+    internal var voiceNoActivityTimeoutMs: Long = DEFAULT_VOICE_NO_ACTIVITY_TIMEOUT_MS
 
     @Volatile
     private var voiceBeginDeferred: CompletableDeferred<Int>? = null
@@ -162,6 +169,24 @@ class RemoteViewModel(
 
     @Volatile
     private var voiceEndedByTv: Boolean = false
+
+    @Volatile
+    private var lastVoiceActivityAtMs: Long = 0L
+
+    @Volatile
+    private var tvVoiceEosDetectedAtMs: Long? = null
+
+    @Volatile
+    private var isVoiceFallbackActive: Boolean = false
+
+    @Volatile
+    private var lastPartialVoiceText: String = ""
+
+    @Volatile
+    private var speechStartCountInFallback: Int = 0
+
+    @Volatile
+    private var suppressNextFallbackError: Boolean = false
 
     @Volatile
     private var isVoiceInteractionActive: Boolean = false
@@ -224,9 +249,18 @@ class RemoteViewModel(
         onVoiceBeginRequested = { sessionId, _ ->
             activeVoiceSessionId = sessionId
             voiceEndedByTv = false
+            tvVoiceEosDetectedAtMs = null
+            lastVoiceActivityAtMs = System.currentTimeMillis()
             isVoiceInteractionActive = true
             refreshVoiceAutoKeyboardSuppression()
             voiceBeginDeferred?.complete(sessionId)
+        },
+        onVoicePayloadAck = { sessionId ->
+            if (activeVoiceSessionId == null || activeVoiceSessionId == sessionId) {
+                if (tvVoiceEosDetectedAtMs == null) {
+                    tvVoiceEosDetectedAtMs = System.currentTimeMillis()
+                }
+            }
         },
         onVoiceEndRequested = { sessionId ->
             if (activeVoiceSessionId == sessionId || activeVoiceSessionId != null) {
@@ -755,10 +789,15 @@ class RemoteViewModel(
 
     fun dismissKeyboardSheet() {
         _isKeyboardSheetVisible.value = false
+        refreshVoiceAutoKeyboardSuppression(KEYBOARD_DISMISS_SUPPRESS_MS)
     }
 
     fun sendKeyboardText(text: String, replaceExisting: Boolean, submitWithEnter: Boolean) {
         if (!ensureConnectedOrPrompt()) return
+        if (submitWithEnter) {
+            _isKeyboardSheetVisible.value = false
+            refreshVoiceAutoKeyboardSuppression(KEYBOARD_DISMISS_SUPPRESS_MS)
+        }
         val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
         realTimeKeyQueue.trySend(
             RealTimeKeyCommand.SendText(
@@ -1031,7 +1070,10 @@ class RemoteViewModel(
     }
 
     private fun refreshVoiceAutoKeyboardSuppression(graceMs: Long = VOICE_AUTO_KEYBOARD_GRACE_MS) {
-        suppressAutoKeyboardUntilMs = System.currentTimeMillis() + graceMs
+        val candidate = System.currentTimeMillis() + graceMs
+        if (candidate > suppressAutoKeyboardUntilMs) {
+            suppressAutoKeyboardUntilMs = candidate
+        }
     }
 
     private fun clearVoiceAutoKeyboardSuppression() {
@@ -1052,17 +1094,88 @@ class RemoteViewModel(
         }
     }
 
+    fun onVoiceFallbackStarted() {
+        voiceFallbackWatchdogJob?.cancel()
+        suppressNextFallbackError = false
+        isVoiceFallbackActive = true
+        lastPartialVoiceText = ""
+        speechStartCountInFallback = 0
+        _isVoiceListening.value = true
+        isVoiceInteractionActive = true
+        refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+        armVoiceFallbackWatchdog()
+    }
+
+    fun reportVoiceSpeechStarted() {
+        if (!isVoiceFallbackActive) return
+        if (speechStartCountInFallback == 0) {
+            speechStartCountInFallback = 1
+            armVoiceFallbackWatchdog()
+        }
+    }
+
+    fun reportVoiceTextActivity(partialText: String) {
+        if (!isVoiceFallbackActive) return
+        val normalized = partialText.trim()
+        if (normalized.isEmpty() || normalized == lastPartialVoiceText) return
+        lastPartialVoiceText = normalized
+        refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+        armVoiceFallbackWatchdog()
+    }
+
+    private fun armVoiceFallbackWatchdog() {
+        voiceFallbackWatchdogJob?.cancel()
+        val timeoutMs = voiceNoActivityTimeoutMs
+        voiceFallbackWatchdogJob = viewModelScope.launch {
+            delay(timeoutMs)
+            onVoiceFallbackTimedOut()
+        }
+    }
+
+    internal fun onVoiceFallbackTimedOut() {
+        if (!isVoiceFallbackActive) return
+        isVoiceFallbackActive = false
+        voiceFallbackWatchdogJob?.cancel()
+        voiceFallbackWatchdogJob = null
+        suppressNextFallbackError = true
+        _isVoiceListening.value = false
+        isVoiceInteractionActive = false
+        refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+        voiceStopChannel.trySend(Unit)
+        showMessage("음성 텍스트 입력이 3초간 작동하지 않아 마이크를 종료했습니다.")
+    }
+
+    private suspend fun triggerTvGoogleAssistant(): Boolean {
+        val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
+        if (remoteClient.isConnected) {
+            val v2Sent = runCatching {
+                remoteClient.sendKey(TvKeyCodes.VOICE_ASSIST, AndroidTvRemoteClient.DIRECTION_SHORT)
+            }.isSuccess
+            if (v2Sent) return true
+        }
+        if (!adbClient.isConnected &&
+            adbClient.adbState.value == AdbConnectionState.DISCONNECTED &&
+            !connectedHost.isNullOrBlank()
+        ) {
+            adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
+        }
+        if (adbClient.isConnected) {
+            return adbClient.triggerGoogleAssistant().isSuccess
+        }
+        return false
+    }
+
     /**
-     * Initiates Android TV Remote v2 PCM voice streaming:
+     * Initiates Android TV Google Assistant + voice input:
      * 1) Dismisses mobile keyboard sheet & suppresses autoShowKeyboard popups triggered by Katniss/Assistant
-     * 2) Checks negotiated TV `FEATURE_VOICE`; falls back immediately to SpeechRecognizer if unsupported
-     * 3) Pre-captures 8 kHz 16-bit mono PCM & sends single `KEYCODE_SEARCH` (Protocol v2 voice trigger)
+     * 2) Launches TV Google Assistant even when `FEATURE_VOICE` is omitted (`tvFeatures = 615`), then starts SpeechRecognizer fallback
+     * 3) Otherwise pre-captures 8 kHz 16-bit mono PCM & sends `KEYCODE_SEARCH` (and `VOICE_ASSIST` fallback if needed)
      * 4) Upon TV's `RemoteVoiceBegin(sessionId)`, echoes `RemoteVoiceBegin` & streams `[8192, 20480]` B chunks
-     * 5) Gracefully flushes & pads trailing PCM before transmitting `RemoteVoiceEnd`
+     * 5) Automatically stops mic after 3 seconds of no voice/text activity or TV EOS grace expiry
      */
     fun startVoiceSession() {
         if (!ensureConnectedOrPrompt()) return
-        if (_isVoiceListening.value) {
+        if (_isVoiceListening.value || isVoiceFallbackActive) {
             stopVoiceSession(sendEndPacket = true)
             return
         }
@@ -1072,17 +1185,31 @@ class RemoteViewModel(
         voiceSessionJob = null
         voiceFinalizeJob?.cancel()
         voiceFinalizeJob = null
+        voiceFallbackWatchdogJob?.cancel()
+        voiceFallbackWatchdogJob = null
+        isVoiceFallbackActive = false
+        suppressNextFallbackError = false
         voiceStreamer.stop()
         activeVoiceSessionId = null
         voiceEndedByTv = false
+        tvVoiceEosDetectedAtMs = null
+        lastVoiceActivityAtMs = System.currentTimeMillis()
         isVoiceInteractionActive = true
         refreshVoiceAutoKeyboardSuppression()
 
         if (remoteClient.isVoiceSupportedByTv == false) {
             voiceBeginDeferred = null
             _isVoiceListening.value = false
-            showMessage("TV 직접 마이크 미지원 — 휴대폰 음성 인식으로 검색합니다.")
-            voiceFallbackChannel.trySend(Unit)
+            voiceSessionJob = viewModelScope.launch {
+                val assistantOpened = triggerTvGoogleAssistant()
+                refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+                if (assistantOpened) {
+                    showMessage("TV 구글 어시스턴트 실행 — 휴대폰 마이크로 말씀하세요.")
+                } else {
+                    showMessage("TV 직접 마이크 미지원 — 휴대폰 음성 인식으로 검색합니다.")
+                }
+                voiceFallbackChannel.trySend(Unit)
+            }
             return
         }
 
@@ -1092,6 +1219,8 @@ class RemoteViewModel(
 
         voiceSessionJob = viewModelScope.launch {
             try {
+                lastVoiceActivityAtMs = System.currentTimeMillis()
+                tvVoiceEosDetectedAtMs = null
                 voiceStreamer.startCapture(
                     scope = viewModelScope,
                     onChunk = { sid, chunk ->
@@ -1104,15 +1233,24 @@ class RemoteViewModel(
                             showMessage("마이크 시작 실패: ${err.message ?: "권한 또는 오디오 장치 오류"}")
                             stopVoiceSession(sendEndPacket = false)
                         }
+                    },
+                    onSpeechDetected = {
+                        lastVoiceActivityAtMs = System.currentTimeMillis()
                     }
                 )
 
-                // Protocol v2 spec: single KEYCODE_SEARCH (84) opens Assistant/search & triggers RemoteVoiceBegin(30)
+                // Protocol v2 spec: send KEYCODE_SEARCH (84) first and await RemoteVoiceBegin(30).
+                // If TV does not open a voice session, also trigger TV Google Assistant directly.
                 runCatching {
                     remoteClient.sendKey(TvKeyCodes.SEARCH, AndroidTvRemoteClient.DIRECTION_SHORT)
                 }
 
-                val sessionId = withTimeoutOrNull(VOICE_BEGIN_WAIT_MS) { beginSignal.await() }
+                var sessionId = withTimeoutOrNull(VOICE_SEARCH_TRIGGER_WAIT_MS) { beginSignal.await() }
+                if (sessionId == null && remoteClient.isConnected && _isVoiceListening.value) {
+                    triggerTvGoogleAssistant()
+                    sessionId = withTimeoutOrNull(VOICE_ASSIST_TRIGGER_WAIT_MS) { beginSignal.await() }
+                }
+
                 if (sessionId == null) {
                     // TV did not open a Protocol v2 RemoteVoiceBegin stream; release mic & fall back to SpeechRecognizer
                     voiceBeginDeferred = null
@@ -1121,7 +1259,7 @@ class RemoteViewModel(
                     if (remoteClient.isConnected) {
                         isVoiceInteractionActive = true
                         refreshVoiceAutoKeyboardSuppression()
-                        showMessage("TV 음성 스트리밍 응답 없음 — 휴대폰 음성 인식으로 전환합니다.")
+                        showMessage("TV 구글 어시스턴트 실행 — 휴대폰 음성 인식으로 전환합니다.")
                         voiceFallbackChannel.trySend(Unit)
                     } else {
                         isVoiceInteractionActive = false
@@ -1134,13 +1272,43 @@ class RemoteViewModel(
                 }
 
                 activeVoiceSessionId = sessionId
-                refreshVoiceAutoKeyboardSuppression()
+                refreshVoiceAutoKeyboardSuppression(VOICE_STREAM_MAX_MS + VOICE_AUTO_KEYBOARD_GRACE_MS)
                 remoteClient.sendVoiceBegin(sessionId)
                 voiceStreamer.activateSession(sessionId)
-                showMessage("TV로 음성을 전송 중입니다. 말씀하신 뒤 마이크를 다시 누르세요.")
+                showMessage("TV 구글 어시스턴트 음성 전송 중 — 말씀 없으면 3초 후 자동 종료됩니다.")
 
-                // Auto-stop after 10 seconds if TV VAD hasn't ended the stream yet
-                delay(VOICE_STREAM_MAX_MS)
+                val streamStartMs = System.currentTimeMillis()
+                if (lastVoiceActivityAtMs < streamStartMs) {
+                    lastVoiceActivityAtMs = streamStartMs
+                }
+                var timedOutForInactivity = false
+                while (isActive && _isVoiceListening.value && !voiceEndedByTv && remoteClient.isConnected) {
+                    val now = System.currentTimeMillis()
+                    val idleMs = now - lastVoiceActivityAtMs
+                    val totalMs = now - streamStartMs
+                    val eosElapsedMs = tvVoiceEosDetectedAtMs?.let { now - it }
+                    val noActivityLimit = voiceNoActivityTimeoutMs
+                    if (idleMs >= noActivityLimit) {
+                        timedOutForInactivity = true
+                        break
+                    }
+                    if (eosElapsedMs != null && eosElapsedMs >= TV_EOS_GRACE_MS) {
+                        break
+                    }
+                    if (totalMs >= VOICE_STREAM_MAX_MS) {
+                        break
+                    }
+                    val sleepMs = minOf(
+                        100L,
+                        (noActivityLimit - idleMs).coerceAtLeast(10L),
+                        (VOICE_STREAM_MAX_MS - totalMs).coerceAtLeast(10L),
+                        eosElapsedMs?.let { (TV_EOS_GRACE_MS - it).coerceAtLeast(10L) } ?: Long.MAX_VALUE
+                    )
+                    delay(sleepMs)
+                }
+                if (timedOutForInactivity && _isVoiceListening.value && !voiceEndedByTv) {
+                    showMessage("음성 입력이 없어 3초 후 마이크를 종료했습니다.")
+                }
                 stopVoiceSession(sendEndPacket = true)
             } catch (_: kotlinx.coroutines.CancellationException) {
                 // Handled by stopVoiceSession
@@ -1157,11 +1325,20 @@ class RemoteViewModel(
     ) {
         val sid = activeVoiceSessionId
         val canSendEnd = sid != null && sendEndPacket && !voiceEndedByTv && remoteClient.isConnected
+        val wasFallbackActive = isVoiceFallbackActive
         activeVoiceSessionId = null
+        tvVoiceEosDetectedAtMs = null
         voiceBeginDeferred?.cancel()
         voiceBeginDeferred = null
         voiceSessionJob?.cancel()
         voiceSessionJob = null
+        isVoiceFallbackActive = false
+        voiceFallbackWatchdogJob?.cancel()
+        voiceFallbackWatchdogJob = null
+        if (wasFallbackActive) {
+            suppressNextFallbackError = true
+            voiceStopChannel.trySend(Unit)
+        }
         _isVoiceListening.value = false
         refreshVoiceAutoKeyboardSuppression()
 
@@ -1193,10 +1370,15 @@ class RemoteViewModel(
     }
 
     fun onVoiceFallbackFinished(errorMessage: String? = null) {
+        val suppressed = suppressNextFallbackError
+        suppressNextFallbackError = false
+        isVoiceFallbackActive = false
+        voiceFallbackWatchdogJob?.cancel()
+        voiceFallbackWatchdogJob = null
         _isVoiceListening.value = false
         isVoiceInteractionActive = false
         refreshVoiceAutoKeyboardSuppression()
-        if (!errorMessage.isNullOrBlank()) {
+        if (!suppressed && !errorMessage.isNullOrBlank()) {
             showMessage(errorMessage)
         }
     }
@@ -1205,11 +1387,17 @@ class RemoteViewModel(
         if (!ensureConnectedOrPrompt()) return
         _isKeyboardSheetVisible.value = false
         refreshVoiceAutoKeyboardSuppression()
-        showMessage("마이크 권한이 거부되어 TV 음성 어시스턴트 키만 전송합니다.")
-        sendKey(TvKeyCodes.VOICE_ASSIST)
+        showMessage("마이크 권한이 거부되어 TV 구글 어시스턴트 키만 전송합니다.")
+        viewModelScope.launch {
+            triggerTvGoogleAssistant()
+        }
     }
 
     fun onVoiceSearchRecognized(spokenText: String) {
+        isVoiceFallbackActive = false
+        voiceFallbackWatchdogJob?.cancel()
+        voiceFallbackWatchdogJob = null
+        suppressNextFallbackError = false
         _isVoiceListening.value = false
         if (spokenText.isBlank()) {
             isVoiceInteractionActive = false
@@ -1226,11 +1414,22 @@ class RemoteViewModel(
         refreshVoiceAutoKeyboardSuppression()
         viewModelScope.launch {
             try {
-                val imeAlreadyActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
-                if (!imeAlreadyActive) {
+                var imeActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
+                if (!imeActive) {
                     // Open TV search and wait until the TV actually reports a focused text field
-                    remoteClient.sendKey(TvKeyCodes.SEARCH, AndroidTvRemoteClient.DIRECTION_SHORT)
-                    awaitTvImeField(VOICE_IME_WAIT_MS)
+                    runCatching {
+                        remoteClient.sendKey(TvKeyCodes.SEARCH, AndroidTvRemoteClient.DIRECTION_SHORT)
+                    }
+                    imeActive = awaitTvImeField(VOICE_IME_WAIT_MS) ||
+                        remoteClient.isImeFieldActive ||
+                        _imePromptState.value.isTvImeVisible
+                }
+                if (!imeActive && adbClient.isConnected) {
+                    val assistantSearch = adbClient.submitGoogleAssistantQuery(spokenText)
+                    if (assistantSearch.isSuccess) {
+                        showMessage("\"$spokenText\" 어시스턴트 음성 검색 실행")
+                        return@launch
+                    }
                 }
                 val done = CompletableDeferred<Boolean>()
                 val queued = realTimeKeyQueue.trySend(
@@ -1261,11 +1460,15 @@ class RemoteViewModel(
             _imePromptState.first { it.isTvImeVisible }
         } != null
 
-    private companion object {
-        const val VOICE_BEGIN_WAIT_MS = 2_500L
-        const val VOICE_STREAM_MAX_MS = 10_000L
-        const val VOICE_AUTO_KEYBOARD_GRACE_MS = 5_000L
-        const val VOICE_IME_WAIT_MS = 3_000L
+    companion object {
+        const val DEFAULT_VOICE_NO_ACTIVITY_TIMEOUT_MS = 3_000L
+        internal const val VOICE_SEARCH_TRIGGER_WAIT_MS = 1_100L
+        internal const val VOICE_ASSIST_TRIGGER_WAIT_MS = 1_100L
+        internal const val VOICE_STREAM_MAX_MS = 10_000L
+        internal const val VOICE_AUTO_KEYBOARD_GRACE_MS = 5_000L
+        internal const val VOICE_IME_WAIT_MS = 1_500L
+        internal const val TV_EOS_GRACE_MS = 1_200L
+        internal const val KEYBOARD_DISMISS_SUPPRESS_MS = 2_000L
     }
 
     fun toggleFavorite(app: TvAppCatalogItem, isCurrentlyFavorite: Boolean) {

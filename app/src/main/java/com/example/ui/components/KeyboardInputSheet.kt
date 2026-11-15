@@ -59,7 +59,13 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import android.content.Context
+import android.view.inputmethod.InputMethodManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
@@ -110,6 +116,22 @@ fun KeyboardInputSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val focusRequester = remember { FocusRequester() }
     val haptic = LocalHapticFeedback.current
+    val hostFocusManager = LocalFocusManager.current
+    val hostKeyboardController = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
+    val hostView = LocalView.current
+
+    fun hidePhoneKeyboardAndClearFocus(extraView: android.view.View? = null) {
+        hostFocusManager.clearFocus(force = true)
+        hostKeyboardController?.hide()
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        extraView?.windowToken?.let { token ->
+            imm?.hideSoftInputFromWindow(token, 0)
+        }
+        hostView.windowToken?.let { token ->
+            imm?.hideSoftInputFromWindow(token, 0)
+        }
+    }
 
     var fieldValue by remember {
         mutableStateOf(
@@ -131,13 +153,27 @@ fun KeyboardInputSheet(
     }
 
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            hidePhoneKeyboardAndClearFocus()
+            onDismiss()
+        },
         sheetState = sheetState,
         dragHandle = null,
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
         containerColor = CharcoalBg,
         contentColor = TextPrimary
     ) {
+        val sheetFocusManager = LocalFocusManager.current
+        val sheetKeyboardController = LocalSoftwareKeyboardController.current
+        val sheetView = LocalView.current
+
+        fun closeSheetAndKeyboard() {
+            sheetFocusManager.clearFocus(force = true)
+            sheetKeyboardController?.hide()
+            hidePhoneKeyboardAndClearFocus(sheetView)
+            onDismiss()
+        }
+
         LaunchedEffect(focusRequester) {
             kotlinx.coroutines.yield()
             runCatching { focusRequester.requestFocus() }
@@ -195,7 +231,7 @@ fun KeyboardInputSheet(
                         .clip(CircleShape)
                         .background(CharcoalSurface)
                         .border(1.dp, CharcoalBorder, CircleShape)
-                        .clickable(onClick = onDismiss)
+                        .clickable(onClick = ::closeSheetAndKeyboard)
                         .testTag("keyboard_close_button"),
                     contentAlignment = Alignment.Center
                 ) {
@@ -211,8 +247,10 @@ fun KeyboardInputSheet(
             Spacer(modifier = Modifier.height(12.dp))
 
             fun submitCurrentText() {
+                val textToSend = fieldValue.text
                 fieldValue = fieldValue.copy(composition = null)
-                onSendText(fieldValue.text, true, true)
+                onSendText(textToSend, true, true)
+                closeSheetAndKeyboard()
             }
 
             OutlinedTextField(

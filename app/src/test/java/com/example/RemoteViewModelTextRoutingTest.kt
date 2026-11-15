@@ -750,10 +750,19 @@ class RemoteViewModelTextRoutingTest {
                 assertEquals(false, viewModel.tvVoiceSupportedForTest)
 
                 viewModel.startVoiceSession()
-                waitUntil(timeoutMs = 1_500) { fallbackCount.get() == 1 }
+                waitUntil(timeoutMs = 1_500) {
+                    fallbackCount.get() == 1 && protocolSent.isNotEmpty()
+                }
                 assertFalse(viewModel.isVoiceListening.value)
                 assertFalse(viewModel.isKeyboardSheetVisible.value)
+                // Even when FEATURE_VOICE is missing (615), Google Assistant key must be transmitted to wake TV Assistant
+                assertEquals(
+                    TvKeyCodes.VOICE_ASSIST.toLong(),
+                    ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0])))
+                        .first { it.number == 10 }.asMessage().first { it.number == 1 }.varint
+                )
 
+                protocolSent.clear()
                 // SpeechRecognizer delivers recognized query -> viewModel sends SEARCH, awaits IME without popping sheet, sends BatchEdit + ENTER
                 viewModel.onVoiceSearchRecognized("오늘 날씨")
                 waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
@@ -891,6 +900,270 @@ class RemoteViewModelTextRoutingTest {
                 assertFalse(viewModel.isKeyboardSheetVisible.value)
             } finally {
                 collectorJob.cancel()
+            }
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `sendKeyboardText submitWithEnter and dismissKeyboardSheet close popup and suppress trailing IME echoes`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.setAutoShowKeyboard(true)
+            waitUntil(timeoutMs = 2_000) { viewModel.preferences.value.autoShowKeyboard }
+            viewModel.configureRemoteClientForTest(connected = true) {}
+
+            kotlinx.coroutines.runBlocking {
+                val showReq = ProtobufWire.encode {
+                    writeMessageField(22) { writeMessageField(2) { writeVarintField(1, 1) } }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(showReq))
+            }
+            assertTrue(viewModel.isKeyboardSheetVisible.value)
+
+            // Sending with submitWithEnter closes sheet immediately & suppresses trailing TV echo
+            viewModel.sendKeyboardText("유튜브", replaceExisting = true, submitWithEnter = true)
+            assertFalse(viewModel.isKeyboardSheetVisible.value)
+
+            kotlinx.coroutines.runBlocking {
+                val trailingEcho = ProtobufWire.encode {
+                    writeMessageField(22) { writeMessageField(2) { writeVarintField(1, 2) } }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(trailingEcho))
+            }
+            assertFalse(viewModel.isKeyboardSheetVisible.value)
+
+            // Explicit open re-shows sheet, dismiss closes + suppresses immediate echo
+            viewModel.openKeyboardSheet()
+            assertTrue(viewModel.isKeyboardSheetVisible.value)
+            viewModel.dismissKeyboardSheet()
+            assertFalse(viewModel.isKeyboardSheetVisible.value)
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `voice fallback submits ADB GLOBAL_SEARCH when TV Assistant opens without EditText`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val adbCommands = CopyOnWriteArrayList<String>()
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+            viewModel.configureAdbClientForTest(connected = true) { cmd ->
+                adbCommands.add(cmd)
+                Result.success("Starting: Intent")
+            }
+
+            // Do not emit RemoteImeShowRequest(22); Katniss overlay has no focused IME field
+            viewModel.onVoiceSearchRecognized("유튜브 틀어줘")
+            waitUntil(timeoutMs = 3_500) {
+                adbCommands.any { it.contains("android.search.action.GLOBAL_SEARCH") } &&
+                    viewModel.snackbarNotice.value != null
+            }
+
+            val searchIntentCmd = adbCommands.first { it.contains("android.search.action.GLOBAL_SEARCH") }
+            assertTrue(searchIntentCmd.contains("--es query '유튜브 틀어줘'"))
+            assertEquals("\"유튜브 틀어줘\" 어시스턴트 음성 검색 실행", viewModel.snackbarNotice.value?.message)
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `voice default inactivity timeout is 3 seconds and stops quiet PCM and fallback STT cleanly`() {
+        assertEquals(3_000L, RemoteViewModel.DEFAULT_VOICE_NO_ACTIVITY_TIMEOUT_MS)
+
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.voiceNoActivityTimeoutMs = 260L
+
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val stopSignals = java.util.concurrent.atomic.AtomicInteger(0)
+            val emitSpeech = java.util.concurrent.atomic.AtomicBoolean(true)
+
+            val collectScope = kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate
+            )
+            val stopCollector = collectScope.launch {
+                viewModel.voiceStopRequests.collect {
+                    stopSignals.incrementAndGet()
+                }
+            }
+
+            try {
+                viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+                viewModel.configureVoiceCaptureForTest { _, isRunning, onFrame ->
+                    // Emit loud frames (> 600 peak) briefly, then switch to near-silence (0x0101 = 257 < 600)
+                    while (isRunning()) {
+                        val sampleByte: Byte = if (emitSpeech.get()) 0x5A else 0x01
+                        onFrame(ByteArray(1600) { sampleByte })
+                        kotlinx.coroutines.delay(50)
+                    }
+                }
+
+                kotlinx.coroutines.runBlocking {
+                    val cfg = ProtobufWire.encode { writeMessageField(1) { writeVarintField(1, 623) } }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(cfg))
+                }
+
+                // 1) PCM stream stays open while speech is active past 260ms, then stops automatically after 260ms silence
+                viewModel.startVoiceSession()
+                waitUntil(timeoutMs = 2_000) { protocolSent.isNotEmpty() }
+                kotlinx.coroutines.runBlocking {
+                    val begin = ProtobufWire.encode {
+                        writeMessageField(30) {
+                            writeVarintField(1, 91)
+                            writeStringField(2, "com.google.android.katniss")
+                        }
+                    }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(begin))
+                }
+                waitUntil(timeoutMs = 2_000) {
+                    protocolSent.any { bytes ->
+                        ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                            .any { it.number == 30 }
+                    }
+                }
+                shadowOf(Looper.getMainLooper()).idleFor(320, TimeUnit.MILLISECONDS)
+                Thread.sleep(320)
+                shadowOf(Looper.getMainLooper()).idle()
+                assertTrue("Mic must stay open during active speech frames", viewModel.isVoiceListening.value)
+
+                emitSpeech.set(false)
+                waitUntil(timeoutMs = 2_500) {
+                    !viewModel.isVoiceListening.value && protocolSent.any { bytes ->
+                        ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                            .any { it.number == 32 }
+                    }
+                }
+                assertEquals("음성 입력이 없어 3초 후 마이크를 종료했습니다.", viewModel.snackbarNotice.value?.message)
+
+                // 2) Fallback SpeechRecognizer extends on new partial voice-text, stops on subsequent inactivity, and ignores post-cancel ERROR_CLIENT
+                viewModel.clearSnackbar()
+                viewModel.onVoiceFallbackStarted()
+                assertTrue(viewModel.isVoiceListening.value)
+
+                Thread.sleep(150)
+                shadowOf(Looper.getMainLooper()).idleFor(150, TimeUnit.MILLISECONDS)
+                viewModel.reportVoiceTextActivity("오늘")
+                assertTrue("Partial text must extend listening past original window", viewModel.isVoiceListening.value)
+
+                // Sending unchanged duplicate partial text must NOT extend timeout indefinitely
+                Thread.sleep(150)
+                shadowOf(Looper.getMainLooper()).idleFor(150, TimeUnit.MILLISECONDS)
+                viewModel.reportVoiceTextActivity("오늘")
+
+                waitUntil(timeoutMs = 2_000) {
+                    stopSignals.get() >= 1 && !viewModel.isVoiceListening.value
+                }
+                assertEquals("음성 텍스트 입력이 3초간 작동하지 않아 마이크를 종료했습니다.", viewModel.snackbarNotice.value?.message)
+
+                // Spurious async cancel callback must NOT overwrite timeout notice
+                viewModel.onVoiceFallbackFinished("음성 인식기를 사용할 수 없습니다.")
+                assertEquals("음성 텍스트 입력이 3초간 작동하지 않아 마이크를 종료했습니다.", viewModel.snackbarNotice.value?.message)
+            } finally {
+                stopCollector.cancel()
+            }
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `when tvFeatures supports voice 623 but ignores SEARCH startVoiceSession wakes Google Assistant before fallback`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            val fallbackCount = java.util.concurrent.atomic.AtomicInteger(0)
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+            viewModel.configureVoiceCaptureForTest { _, isRunning, _ ->
+                while (isRunning()) {
+                    kotlinx.coroutines.delay(20)
+                }
+            }
+
+            val collectScope = kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate
+            )
+            val collector = collectScope.launch {
+                viewModel.voiceFallbackRequests.collect { fallbackCount.incrementAndGet() }
+            }
+
+            try {
+                kotlinx.coroutines.runBlocking {
+                    val cfg = ProtobufWire.encode { writeMessageField(1) { writeVarintField(1, 623) } }
+                    viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(cfg))
+                }
+
+                viewModel.startVoiceSession()
+                // Waits 1.1s after SEARCH then sends VOICE_ASSIST, waits 1.1s then triggers SpeechRecognizer fallback
+                waitUntil(timeoutMs = 4_000) {
+                    fallbackCount.get() == 1 && protocolSent.size >= 2
+                }
+
+                val sentKeys = protocolSent.map { bytes ->
+                    ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                        .first { it.number == 10 }.asMessage()
+                        .first { it.number == 1 }.varint
+                }
+                assertEquals(listOf(TvKeyCodes.SEARCH.toLong(), TvKeyCodes.VOICE_ASSIST.toLong()), sentKeys)
+                assertFalse(viewModel.isVoiceListening.value)
+            } finally {
+                collector.cancel()
             }
         } finally {
             store.clear()
