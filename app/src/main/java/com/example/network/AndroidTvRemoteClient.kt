@@ -84,6 +84,15 @@ class AndroidTvRemoteClient(
     val isVoiceSupportedByTv: Boolean?
         get() = isVoiceFeatureSupported(tvFeatures)
 
+    val currentForegroundAppPackage: String?
+        get() = currentForegroundPackage
+
+    val isKatnissForeground: Boolean
+        get() = isKatnissPackage(currentForegroundPackage) || isKatnissPackage(lastImeAppPackage)
+
+    val isEditableImeFieldActive: Boolean
+        get() = isImeFieldActive && !isKatnissForeground
+
     @Volatile
     var isImeFieldActive: Boolean = false
         private set
@@ -229,16 +238,25 @@ class AndroidTvRemoteClient(
                 20 -> { // remote_ime_key_inject (reports active app, app_info.counter & IME status)
                     val imeFields = field.asMessage()
                     val appInfo = imeFields.firstOrNull { it.number == 1 && it.wireType == 2 }?.asMessage()
-                    if (appInfo != null) {
-                        val incomingImeCounter = appInfo.firstOrNull { it.number == 1 && it.wireType == 0 }?.varint?.toInt() ?: 0
-                        imeCounter = incomingImeCounter
-                        hasKeyInjectImeCounter = incomingImeCounter != 0
-                    }
-
                     // RemoteAppInfo.app_package is field 12 (string); field 3 is int3 (varint)
                     val pkg = appInfo?.firstOrNull { it.number == 12 && it.wireType == 2 }?.asString()
+                    val previousPkg = currentForegroundPackage
+                    val appSwitched = !pkg.isNullOrBlank() && previousPkg != null && previousPkg != pkg
+                    val textStatus = imeFields.firstOrNull { it.number == 2 && it.wireType == 2 }?.asMessage()
+
+                    if (appInfo != null) {
+                        val counterField = appInfo.firstOrNull { it.number == 1 && it.wireType == 0 }
+                        if (counterField != null) {
+                            val incomingImeCounter = counterField.varint.toInt()
+                            imeCounter = incomingImeCounter
+                            hasKeyInjectImeCounter = incomingImeCounter != 0
+                        } else if (appSwitched || textStatus == null) {
+                            imeCounter = 0
+                            hasKeyInjectImeCounter = false
+                        }
+                    }
+
                     if (!pkg.isNullOrBlank()) {
-                        val previousPkg = currentForegroundPackage
                         currentForegroundPackage = pkg
                         if (isImeFieldActive && previousPkg != null && previousPkg != pkg && lastImeAppPackage != pkg) {
                             isImeFieldActive = false
@@ -247,7 +265,6 @@ class AndroidTvRemoteClient(
                         }
                         onForegroundAppChanged(pkg)
                     }
-                    val textStatus = imeFields.firstOrNull { it.number == 2 && it.wireType == 2 }?.asMessage()
                     if (textStatus != null) {
                         val wasActive = isImeFieldActive
                         val prevFieldCounter = fieldCounter
@@ -636,6 +653,10 @@ class AndroidTvRemoteClient(
         const val FEATURE_VOLUME = 64
         const val FEATURE_APP_LINK = 512
         const val REMOTE_FEATURES = 639 // PING(1)|KEY(2)|IME(4)|VOICE(8)|LEGACY(16)|POWER(32)|VOLUME(64)|APP_LINK(512)
+        const val KATNISS_PACKAGE = "com.google.android.katniss"
+
+        fun isKatnissPackage(pkg: String?): Boolean =
+            pkg?.equals(KATNISS_PACKAGE, ignoreCase = true) == true
 
 
         fun parseRemoteConfigureFeatures(configFields: List<ProtobufWire.Field>): Int? =

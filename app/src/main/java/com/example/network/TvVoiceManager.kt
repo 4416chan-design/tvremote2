@@ -70,7 +70,7 @@ class TvVoiceManager(
     private val voiceBeginTimeoutMs: Long = DEFAULT_VOICE_BEGIN_TIMEOUT_MS,
     private val preCaptureBeforeVoiceBegin: Boolean = true,
     private val tailDelayMs: Long = DEFAULT_TAIL_DELAY_MS,
-    private val noActivityTimeoutMs: Long? = DEFAULT_NO_ACTIVITY_TIMEOUT_MS,
+    @Volatile var noActivityTimeoutMs: Long? = DEFAULT_NO_ACTIVITY_TIMEOUT_MS,
     private val maxStreamDurationMs: Long? = DEFAULT_MAX_STREAM_DURATION_MS,
     private val coalesceChunksTo8Kb20Kb: Boolean = true,
     private val onEvent: (VoiceEvent) -> Unit = {},
@@ -389,6 +389,12 @@ class TvVoiceManager(
     private var lastSpeechActivityAtMs: Long = 0L
 
     @Volatile
+    private var tvVoiceEosDetectedAtMs: Long? = null
+
+    @Volatile
+    private var pendingTvVoiceError: Pair<String, Boolean>? = null
+
+    @Volatile
     private var captureFailure: Throwable? = null
 
     private fun updateState(next: State) {
@@ -477,6 +483,8 @@ class TvVoiceManager(
         immediateCancelRequested = false
         tvEndedSession = false
         activeSessionId = null
+        tvVoiceEosDetectedAtMs = null
+        pendingTvVoiceError = null
         captureFailure = null
         sessionIdDeferred?.cancel()
         stopSignal?.cancel()
@@ -572,6 +580,28 @@ class TvVoiceManager(
             }
 
             var activeCaptureJob: Job? = null
+
+            suspend fun stopAndJoinRecorderNow() {
+                captureActive = false
+                val job = activeCaptureJob
+                if (job != null) {
+                    withContext(NonCancellable) {
+                        val stoppedCleanly = withTimeoutOrNull(RELEASE_FINISH_GRACE_MS) {
+                            job.join()
+                            true
+                        } ?: false
+                        if (!stoppedCleanly) {
+                            job.cancel()
+                            runCatching { job.join() }
+                        }
+                    }
+                    if (captureJob === job) {
+                        captureJob = null
+                    }
+                    activeCaptureJob = null
+                }
+            }
+
             try {
                 if (stopRequested || immediateCancelRequested) {
                     return@launch
@@ -596,6 +626,7 @@ class TvVoiceManager(
                 if (parsedSessionId == null) {
                     if (!stopRequested && !immediateCancelRequested && _state.value == State.WAITING_FOR_SESSION) {
                         val msg = "TV가 RemoteVoiceBegin 세션을 열지 않았습니다."
+                        stopAndJoinRecorderNow()
                         updateState(State.IDLE)
                         onEvent(VoiceEvent.VoiceBeginTimeout(msg))
                     }
@@ -647,10 +678,15 @@ class TvVoiceManager(
                     val now = System.currentTimeMillis()
                     val idleMs = now - lastSpeechActivityAtMs
                     val totalMs = now - streamStartMs
+                    val eosElapsedMs = tvVoiceEosDetectedAtMs?.let { now - it }
 
                     val noAct = noActivityTimeoutMs
                     if (noAct != null && idleMs >= noAct) {
                         endReason = EndReason.INACTIVITY_TIMEOUT
+                        break
+                    }
+                    if (eosElapsedMs != null && eosElapsedMs >= DEFAULT_TV_EOS_GRACE_MS) {
+                        endReason = EndReason.TV_ENDED
                         break
                     }
                     val maxDur = maxStreamDurationMs
@@ -661,6 +697,7 @@ class TvVoiceManager(
                     val sleepMs = minOf(
                         100L,
                         noAct?.let { (it - idleMs).coerceAtLeast(10L) } ?: Long.MAX_VALUE,
+                        eosElapsedMs?.let { (DEFAULT_TV_EOS_GRACE_MS - it).coerceAtLeast(10L) } ?: Long.MAX_VALUE,
                         maxDur?.let { (it - totalMs).coerceAtLeast(10L) } ?: Long.MAX_VALUE
                     )
                     withTimeoutOrNull(sleepMs) {
@@ -670,8 +707,12 @@ class TvVoiceManager(
             } catch (_: CancellationException) {
                 // Cancellation from cancel()/onCleared() or TV RemoteVoiceEnd
             } catch (sec: SecurityException) {
+                stopAndJoinRecorderNow()
+                updateState(State.IDLE)
                 onEvent(VoiceEvent.Error("RECORD_AUDIO 권한이 필요합니다.", sec))
             } catch (t: Throwable) {
+                stopAndJoinRecorderNow()
+                updateState(State.IDLE)
                 onEvent(
                     VoiceEvent.Error(
                         message = t.message ?: "음성 스트리밍 중 오류가 발생했습니다.",
@@ -695,22 +736,7 @@ class TvVoiceManager(
                     }
                 }
 
-                captureActive = false
-                if (activeCaptureJob != null) {
-                    withContext(NonCancellable) {
-                        val stoppedCleanly = withTimeoutOrNull(RELEASE_FINISH_GRACE_MS) {
-                            activeCaptureJob.join()
-                            true
-                        } ?: false
-                        if (!stoppedCleanly) {
-                            activeCaptureJob.cancel()
-                            runCatching { activeCaptureJob.join() }
-                        }
-                    }
-                }
-                if (captureJob === activeCaptureJob) {
-                    captureJob = null
-                }
+                stopAndJoinRecorderNow()
 
                 if (sid != null && shouldSendEnd && !tvEndedSession && !immediateCancelRequested && transport.isConnected) {
                     withContext(NonCancellable) {
@@ -742,6 +768,11 @@ class TvVoiceManager(
                     stopSignal = null
                 }
                 updateState(State.IDLE)
+                val deferredError = pendingTvVoiceError
+                if (deferredError != null) {
+                    pendingTvVoiceError = null
+                    onEvent(VoiceEvent.Error(deferredError.first, recoverableWithFallback = deferredError.second))
+                }
             }
         }
     }
@@ -782,6 +813,9 @@ class TvVoiceManager(
         if (message.hasRemoteVoiceBegin()) {
             onTvVoiceBegin(message.remoteVoiceBegin.sessionId)
         }
+        if (message.hasRemoteVoicePayload()) {
+            onTvVoicePayloadAck(message.remoteVoicePayload.sessionId)
+        }
         if (message.hasRemoteVoiceEnd()) {
             onTvVoiceEnd(message.remoteVoiceEnd.sessionId)
         }
@@ -807,6 +841,15 @@ class TvVoiceManager(
         sessionIdDeferred?.complete(sessionId)
     }
 
+    fun onTvVoicePayloadAck(sessionId: Int) {
+        val sid = activeSessionId
+        if (sid != null && (sessionId == sid || sessionId == 0)) {
+            if (tvVoiceEosDetectedAtMs == null) {
+                tvVoiceEosDetectedAtMs = System.currentTimeMillis()
+            }
+        }
+    }
+
     fun onTvVoiceEnd(sessionId: Int) {
         val sid = activeSessionId
         if (sid != null && (sessionId == sid || sessionId == 0)) {
@@ -828,14 +871,22 @@ class TvVoiceManager(
         tvEndedSession = true
         immediateCancelRequested = true
         captureActive = false
-        stopSignal?.complete(Unit)
-        sessionIdDeferred?.cancel()
-        sessionIdDeferred = null
-        captureJob?.cancel()
-        sessionJob?.cancel()
         activeSessionId = null
-        updateState(State.IDLE)
-        onEvent(VoiceEvent.Error(detail, recoverableWithFallback = recoverableWithFallback))
+        val activeSessionJob = sessionJob
+        if (activeSessionJob != null && activeSessionJob.isActive) {
+            pendingTvVoiceError = detail to recoverableWithFallback
+            stopSignal?.complete(Unit)
+            sessionIdDeferred?.cancel()
+            sessionIdDeferred = null
+        } else {
+            stopSignal?.complete(Unit)
+            sessionIdDeferred?.cancel()
+            sessionIdDeferred = null
+            captureJob?.cancel()
+            sessionJob?.cancel()
+            updateState(State.IDLE)
+            onEvent(VoiceEvent.Error(detail, recoverableWithFallback = recoverableWithFallback))
+        }
     }
 
     fun cancel() {
@@ -843,6 +894,8 @@ class TvVoiceManager(
         immediateCancelRequested = true
         captureActive = false
         tvEndedSession = true
+        tvVoiceEosDetectedAtMs = null
+        pendingTvVoiceError = null
         stopSignal?.complete(Unit)
         stopSignal = null
         sessionIdDeferred?.cancel()
@@ -877,6 +930,7 @@ class TvVoiceManager(
         const val DEFAULT_VOICE_BEGIN_TIMEOUT_MS = 1_500L
         const val DEFAULT_TAIL_DELAY_MS = 300L
         const val DEFAULT_NO_ACTIVITY_TIMEOUT_MS = 3_000L
+        const val DEFAULT_TV_EOS_GRACE_MS = 1_200L
         const val DEFAULT_MAX_STREAM_DURATION_MS = 10_000L
         const val DEFAULT_CONNECT_TIMEOUT_MS = 8_000
         const val MAX_FRAME_BYTES = 1024 * 1024

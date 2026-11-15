@@ -142,6 +142,204 @@ class RemoteViewModelVoiceRobolectricTest {
         }
     }
 
+    @Test
+    fun `toggleTapToTalkVoiceSession auto-stops after inactivity timeout when no user speech occurs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val repository = TvRemoteRepository(db)
+            runBlocking { repository.ensureDefaultsInitialized() }
+            val factory = RemoteViewModel.Factory(
+                repository = repository,
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.voiceNoActivityTimeoutMs = 260L
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val sentFrames = CopyOnWriteArrayList<ByteArray>()
+            val captureStopped = AtomicBoolean(false)
+
+            viewModel.configureRemoteClientForTest(connected = true) { bytes ->
+                sentFrames.add(bytes)
+            }
+            viewModel.configureVoiceCaptureForTest { _, isRunning, onFrame ->
+                try {
+                    while (isRunning()) {
+                        // Emit quiet room noise (0x0202 = 514 < SPEECH_PEAK_THRESHOLD = 2000)
+                        onFrame(ByteArray(1600) { 0x02 })
+                        delay(40)
+                    }
+                } finally {
+                    captureStopped.set(true)
+                }
+            }
+
+            viewModel.toggleTapToTalkVoiceSession()
+            waitUntil(1_500L) { sentFrames.isNotEmpty() && viewModel.isVoiceListening.value }
+
+            runBlocking {
+                val tvBegin = RemoteMessage.newBuilder()
+                    .setRemoteVoiceBegin(
+                        RemoteVoiceBegin.newBuilder()
+                            .setSessionId(88)
+                            .setPackageName("com.google.android.katniss")
+                            .build()
+                    )
+                    .build()
+                    .toByteArray()
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(tvBegin))
+            }
+
+            // Without a 2nd tap, microphone must automatically deactivate after inactivity timeout
+            waitUntil(2_500L) {
+                !viewModel.isVoiceListening.value &&
+                    captureStopped.get() &&
+                    sentFrames.any { bytes ->
+                        TvVoiceManager.readDelimitedMessage(ByteArrayInputStream(bytes)).hasRemoteVoiceEnd()
+                    }
+            }
+            assertEquals("음성 입력이 없어 3초 후 마이크를 종료했습니다.", viewModel.snackbarNotice.value?.message)
+        } finally {
+            store.clear()
+            shadowOf(Looper.getMainLooper()).idle()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `Xiaomi TV A Pro Katniss fake IME status does not block ADB GLOBAL_SEARCH and editable field skips SEARCH`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val repository = TvRemoteRepository(db)
+            runBlocking { repository.ensureDefaultsInitialized() }
+            val factory = RemoteViewModel.Factory(
+                repository = repository,
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            viewModel.voiceNoActivityTimeoutMs = 260L
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val sentFrames = CopyOnWriteArrayList<ByteArray>()
+            val adbCommands = CopyOnWriteArrayList<String>()
+            viewModel.configureRemoteClientForTest(connected = true) { bytes ->
+                sentFrames.add(bytes)
+            }
+            viewModel.configureAdbClientForTest(connected = true) { cmd ->
+                adbCommands.add(cmd)
+                Result.success("Starting: Intent")
+            }
+
+            // 1. Xiaomi TV A Pro Katniss reports RemoteImeKeyInject(20) + RemoteImeShowRequest(22) for com.google.android.katniss
+            runBlocking {
+                val katnissIme = ProtobufWire.encode {
+                    writeMessageField(20) {
+                        writeMessageField(1) {
+                            writeVarintField(1, 3)
+                            writeStringField(12, "com.google.android.katniss")
+                        }
+                        writeMessageField(2) {
+                            writeVarintField(1, 10)
+                            writeVarintField(5, 1)
+                        }
+                    }
+                    writeMessageField(22) {
+                        writeMessageField(2) {
+                            writeVarintField(1, 10)
+                            writeVarintField(5, 1)
+                        }
+                    }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(katnissIme))
+            }
+
+            // Simulate SpeechRecognizer partial text -> endOfSpeech -> delayed final result past 260ms
+            viewModel.onVoiceFallbackStarted()
+            viewModel.reportVoiceSpeechStarted()
+            viewModel.reportVoiceTextActivity("넷플릭스 오징어게임")
+            viewModel.reportVoiceEndOfSpeech()
+            shadowOf(Looper.getMainLooper()).idleFor(350, TimeUnit.MILLISECONDS)
+            Thread.sleep(350)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            // Now deliver final SpeechRecognizer result: must NOT treat Katniss as an editable EditText,
+            // and must execute ADB GLOBAL_SEARCH with the spoken query!
+            viewModel.onVoiceSearchRecognized("넷플릭스 오징어게임")
+            waitUntil(3_500L) {
+                adbCommands.any { it.contains("android.search.action.GLOBAL_SEARCH") } &&
+                    viewModel.snackbarNotice.value != null
+            }
+            val globalSearchCmd = adbCommands.first { it.contains("android.search.action.GLOBAL_SEARCH") }
+            assertTrue(globalSearchCmd.contains("--es query '넷플릭스 오징어게임'"))
+            assertEquals("\"넷플릭스 오징어게임\" 어시스턴트 음성 검색 실행", viewModel.snackbarNotice.value?.message)
+
+            // 2. When a real editable app search field (e.g. YouTube) is active, tapping Mic starts phone STT directly
+            //    without sending KEYCODE_SEARCH or KEYCODE_VOICE_ASSIST (preserving focus in the search box)
+            sentFrames.clear()
+            adbCommands.clear()
+            runBlocking {
+                val youtubeIme = ProtobufWire.encode {
+                    writeMessageField(20) {
+                        writeMessageField(1) {
+                            writeVarintField(1, 4)
+                            writeStringField(12, "com.google.android.youtube.tv")
+                        }
+                        writeMessageField(2) {
+                            writeVarintField(1, 11)
+                            writeVarintField(5, 1)
+                        }
+                    }
+                    writeMessageField(22) {
+                        writeMessageField(2) {
+                            writeVarintField(1, 11)
+                            writeVarintField(5, 1)
+                        }
+                    }
+                }
+                viewModel.applyRemoteFieldsForTest(ProtobufWire.parseFields(youtubeIme))
+            }
+
+            viewModel.toggleTapToTalkVoiceSession()
+            shadowOf(Looper.getMainLooper()).idle()
+            // Must NOT send KEYCODE_SEARCH(84) or KEYCODE_VOICE_ASSIST(231) when already inside an editable field
+            assertTrue(sentFrames.isEmpty())
+
+            viewModel.onVoiceSearchRecognized("아이유 콘서트")
+            waitUntil(3_000L) {
+                sentFrames.any { bytes ->
+                    val fields = ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(bytes)))
+                    fields.any { it.number == 21 }
+                }
+            }
+            val batchFrame = sentFrames.map {
+                ProtobufWire.parseFields(ProtobufWire.readFramedMessage(ByteArrayInputStream(it)))
+            }.first { f -> f.any { it.number == 21 } }
+            val textSent = batchFrame.first { it.number == 21 }.asMessage()
+                .first { it.number == 3 }.asMessage()
+                .first { it.number == 2 }.asMessage()
+                .first { it.number == 3 }.asString()
+            assertEquals("아이유 콘서트", textSent)
+        } finally {
+            store.clear()
+            shadowOf(Looper.getMainLooper()).idle()
+            db.close()
+        }
+    }
+
     private fun waitUntil(timeoutMs: Long, predicate: () -> Boolean) {
         val mainLooperShadow = shadowOf(Looper.getMainLooper())
         val deadline = SystemClock.uptimeMillis() + timeoutMs

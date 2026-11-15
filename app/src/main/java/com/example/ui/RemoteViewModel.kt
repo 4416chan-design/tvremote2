@@ -166,6 +166,7 @@ class RemoteViewModel(
                 val recorder = pushToTalkPcmRecorderOverride ?: hardwareVoiceRecorder
                 recorder.record(bufferSizeBytes, isActive, onPcmChunk)
             },
+            noActivityTimeoutMs = voiceNoActivityTimeoutMs,
             onSpeechDetected = {
                 lastVoiceActivityAtMs = System.currentTimeMillis()
             },
@@ -182,6 +183,10 @@ class RemoteViewModel(
 
     @Volatile
     internal var voiceNoActivityTimeoutMs: Long = DEFAULT_VOICE_NO_ACTIVITY_TIMEOUT_MS
+        set(value) {
+            field = value
+            voiceManager.noActivityTimeoutMs = value
+        }
 
     @Volatile
     private var voiceBeginDeferred: CompletableDeferred<Int>? = null
@@ -202,6 +207,12 @@ class RemoteViewModel(
     private var isVoiceFallbackActive: Boolean = false
 
     @Volatile
+    private var isVoiceFallbackAwaitingResults: Boolean = false
+
+    @Volatile
+    private var lastVoiceRmsActivityAtMs: Long = 0L
+
+    @Volatile
     private var lastPartialVoiceText: String = ""
 
     @Volatile
@@ -215,6 +226,19 @@ class RemoteViewModel(
 
     @Volatile
     private var suppressAutoKeyboardUntilMs: Long = 0L
+
+    @Volatile
+    private var tvVoiceSessionUnsupported: Boolean = false
+
+    private data class PendingBatchEditAttempt(
+        val host: String?,
+        val text: String,
+        val submitWithEnter: Boolean,
+        val timestampMs: Long
+    )
+
+    @Volatile
+    private var lastBatchEditAttempt: PendingBatchEditAttempt? = null
 
     private val pairingClient = AndroidTvPairingClient(certStore)
     private val remoteClient: AndroidTvRemoteClient = AndroidTvRemoteClient(
@@ -269,6 +293,7 @@ class RemoteViewModel(
             }
         },
         onVoiceBeginRequested = { sessionId, _ ->
+            tvVoiceSessionUnsupported = false
             activeVoiceSessionId = sessionId
             voiceEndedByTv = false
             tvVoiceEosDetectedAtMs = null
@@ -279,6 +304,7 @@ class RemoteViewModel(
             voiceBeginDeferred?.complete(sessionId)
         },
         onVoicePayloadAck = { sessionId ->
+            voiceManager.onTvVoicePayloadAck(sessionId)
             if (activeVoiceSessionId == null || activeVoiceSessionId == sessionId) {
                 if (tvVoiceEosDetectedAtMs == null) {
                     tvVoiceEosDetectedAtMs = System.currentTimeMillis()
@@ -303,6 +329,7 @@ class RemoteViewModel(
                 activeVoiceSessionId != null ||
                 voiceFinalizeJob?.isActive == true
             if (errInfo.offendingFieldNumber in 30..32 && voiceInFlight) {
+                tvVoiceSessionUnsupported = true
                 if (pttInFlight) {
                     voiceManager.onTvVoiceError(errInfo.detail, recoverableWithFallback = true)
                 } else {
@@ -320,6 +347,19 @@ class RemoteViewModel(
                         }
                     }
                 }
+            } else if (errInfo.offendingFieldNumber == 21) {
+                val pending = lastBatchEditAttempt
+                if (pending != null &&
+                    pending.text.isNotEmpty() &&
+                    System.currentTimeMillis() - pending.timestampMs <= BATCH_EDIT_ERROR_FALLBACK_WINDOW_MS
+                ) {
+                    lastBatchEditAttempt = null
+                    viewModelScope.launch {
+                        fallbackAfterBatchEditRejected(pending)
+                    }
+                } else if (errInfo.detail.isNotBlank()) {
+                    showMessage(errInfo.detail)
+                }
             } else if (errInfo.detail.isNotBlank()) {
                 showMessage(errInfo.detail)
             }
@@ -328,6 +368,8 @@ class RemoteViewModel(
             voiceManager.cancel()
             stopVoiceSession(sendEndPacket = false)
             clearVoiceAutoKeyboardSuppression()
+            tvVoiceSessionUnsupported = false
+            lastBatchEditAttempt = null
             adbConnectJob?.cancel()
             adbClient.disconnect()
             hasUserManuallyToggledLanguage = false
@@ -1039,6 +1081,12 @@ class RemoteViewModel(
 
         var remoteFailure: Throwable? = null
         if (remoteClient.isConnected) {
+            lastBatchEditAttempt = PendingBatchEditAttempt(
+                host = host,
+                text = text,
+                submitWithEnter = submitWithEnter,
+                timestampMs = System.currentTimeMillis()
+            )
             val imeResult = runCatching {
                 remoteClient.sendText(
                     text = text,
@@ -1053,6 +1101,7 @@ class RemoteViewModel(
                 }
                 return true
             }
+            lastBatchEditAttempt = null
             remoteFailure = imeResult.exceptionOrNull()
         }
 
@@ -1106,6 +1155,75 @@ class RemoteViewModel(
         return false
     }
 
+    private suspend fun fallbackAfterBatchEditRejected(pending: PendingBatchEditAttempt) {
+        val host = pending.host ?: (_connectionState.value as? TvConnectionState.Connected)?.host
+        if (!adbClient.isConnected &&
+            adbClient.adbState.value == AdbConnectionState.DISCONNECTED &&
+            !host.isNullOrBlank()
+        ) {
+            adbClient.connect(host, NetworkAdbClient.DEFAULT_ADB_PORT)
+        }
+
+        if (!isEditableTvImeActive() && adbClient.isConnected) {
+            val assistantRes = adbClient.submitGoogleAssistantQuery(pending.text)
+            if (assistantRes.isSuccess) {
+                showMessage("\"${pending.text}\" 어시스턴트 음성 검색 실행")
+                return
+            }
+        }
+
+        if (adbClient.isConnected && NetworkAdbClient.isAsciiInputSupported(pending.text)) {
+            val adbRes = adbClient.sendInputText(
+                text = pending.text,
+                clearCount = 0,
+                submitWithEnter = pending.submitWithEnter
+            )
+            if (adbRes.isSuccess) {
+                lastAdbSentTextLength = if (pending.submitWithEnter) 0 else pending.text.length
+                showMessage("ADB로 입력을 전송했습니다.")
+                return
+            }
+        }
+
+        if (remoteClient.isConnected) {
+            val edit = TvImeKeycodeMap.computeRealTimeEditActions(
+                previousText = "",
+                previousSelectionStart = 0,
+                previousSelectionEnd = 0,
+                newText = pending.text,
+                imeType = _tvImeStatus.value.imeType
+            )
+            if (edit.keyActions.isNotEmpty()) {
+                var allSent = true
+                for (action in edit.keyActions) {
+                    val sent = runCatching {
+                        remoteClient.sendPhysicalKey(
+                            keyCode = action.keyCode,
+                            shift = action.shift,
+                            ctrl = action.ctrl
+                        )
+                    }.isSuccess
+                    if (!sent) {
+                        allSent = false
+                        break
+                    }
+                }
+                if (allSent && pending.submitWithEnter) {
+                    runCatching {
+                        remoteClient.sendKey(TvKeyCodes.ENTER, AndroidTvRemoteClient.DIRECTION_SHORT)
+                    }
+                }
+                if (allSent) {
+                    return
+                }
+            }
+        }
+    }
+
+    private fun isEditableTvImeActive(): Boolean =
+        !remoteClient.isKatnissForeground &&
+            (remoteClient.isEditableImeFieldActive || _imePromptState.value.isTvImeVisible)
+
     private fun refreshVoiceAutoKeyboardSuppression(graceMs: Long = VOICE_AUTO_KEYBOARD_GRACE_MS) {
         val candidate = System.currentTimeMillis() + graceMs
         if (candidate > suppressAutoKeyboardUntilMs) {
@@ -1135,6 +1253,8 @@ class RemoteViewModel(
         voiceFallbackWatchdogJob?.cancel()
         suppressNextFallbackError = false
         isVoiceFallbackActive = true
+        isVoiceFallbackAwaitingResults = false
+        lastVoiceRmsActivityAtMs = 0L
         lastPartialVoiceText = ""
         speechStartCountInFallback = 0
         _isVoiceListening.value = true
@@ -1145,10 +1265,20 @@ class RemoteViewModel(
 
     fun reportVoiceSpeechStarted() {
         if (!isVoiceFallbackActive) return
-        if (speechStartCountInFallback == 0) {
-            speechStartCountInFallback = 1
-            armVoiceFallbackWatchdog()
-        }
+        isVoiceFallbackAwaitingResults = false
+        speechStartCountInFallback += 1
+        refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+        armVoiceFallbackWatchdog()
+    }
+
+    fun reportVoiceRmsChanged(rmsdB: Float) {
+        if (!isVoiceFallbackActive || isVoiceFallbackAwaitingResults) return
+        if (speechStartCountInFallback <= 0 || rmsdB < VOICE_RMS_ACTIVE_DB_THRESHOLD) return
+        val now = System.currentTimeMillis()
+        if (now - lastVoiceRmsActivityAtMs < VOICE_RMS_REARM_THROTTLE_MS) return
+        lastVoiceRmsActivityAtMs = now
+        refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+        armVoiceFallbackWatchdog()
     }
 
     fun reportVoiceTextActivity(partialText: String) {
@@ -1157,12 +1287,24 @@ class RemoteViewModel(
         if (normalized.isEmpty() || normalized == lastPartialVoiceText) return
         lastPartialVoiceText = normalized
         refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
-        armVoiceFallbackWatchdog()
+        val timeoutMs = if (isVoiceFallbackAwaitingResults) {
+            maxOf(voiceNoActivityTimeoutMs, VOICE_FALLBACK_RESULT_WAIT_MS)
+        } else {
+            voiceNoActivityTimeoutMs
+        }
+        armVoiceFallbackWatchdog(timeoutMs)
     }
 
-    private fun armVoiceFallbackWatchdog() {
+    fun reportVoiceEndOfSpeech() {
+        _isVoiceListening.value = false
+        if (!isVoiceFallbackActive) return
+        isVoiceFallbackAwaitingResults = true
+        refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+        armVoiceFallbackWatchdog(maxOf(voiceNoActivityTimeoutMs, VOICE_FALLBACK_RESULT_WAIT_MS))
+    }
+
+    private fun armVoiceFallbackWatchdog(timeoutMs: Long = voiceNoActivityTimeoutMs) {
         voiceFallbackWatchdogJob?.cancel()
-        val timeoutMs = voiceNoActivityTimeoutMs
         voiceFallbackWatchdogJob = viewModelScope.launch {
             delay(timeoutMs)
             onVoiceFallbackTimedOut()
@@ -1171,14 +1313,20 @@ class RemoteViewModel(
 
     internal fun onVoiceFallbackTimedOut() {
         if (!isVoiceFallbackActive) return
+        val pendingPartial = if (isVoiceFallbackAwaitingResults) lastPartialVoiceText.trim() else ""
         isVoiceFallbackActive = false
+        isVoiceFallbackAwaitingResults = false
         voiceFallbackWatchdogJob?.cancel()
         voiceFallbackWatchdogJob = null
         suppressNextFallbackError = true
         _isVoiceListening.value = false
+        voiceStopChannel.trySend(Unit)
+        if (pendingPartial.isNotEmpty()) {
+            onVoiceSearchRecognized(pendingPartial)
+            return
+        }
         isVoiceInteractionActive = false
         refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
-        voiceStopChannel.trySend(Unit)
         showMessage("음성 텍스트 입력이 3초간 작동하지 않아 마이크를 종료했습니다.")
     }
 
@@ -1231,6 +1379,7 @@ class RemoteViewModel(
         voiceFallbackWatchdogJob?.cancel()
         voiceFallbackWatchdogJob = null
         isVoiceFallbackActive = false
+        isVoiceFallbackAwaitingResults = false
         suppressNextFallbackError = false
         voiceStreamer.stop()
         activeVoiceSessionId = null
@@ -1240,7 +1389,14 @@ class RemoteViewModel(
         isVoiceInteractionActive = true
         refreshVoiceAutoKeyboardSuppression()
 
-        if (remoteClient.isVoiceSupportedByTv == false) {
+        if (isEditableTvImeActive()) {
+            _isVoiceListening.value = false
+            showMessage("TV 입력창 음성 받아쓰기 — 휴대폰 마이크로 말씀하세요.")
+            voiceFallbackChannel.trySend(Unit)
+            return
+        }
+
+        if (remoteClient.isVoiceSupportedByTv == false || tvVoiceSessionUnsupported) {
             _isVoiceListening.value = false
             voiceSessionJob = viewModelScope.launch {
                 val assistantOpened = triggerTvGoogleAssistant()
@@ -1298,12 +1454,15 @@ class RemoteViewModel(
                 }
             }
             is TvVoiceManager.VoiceEvent.VoiceBeginTimeout -> {
+                tvVoiceSessionUnsupported = true
                 _isVoiceListening.value = false
                 if (remoteClient.isConnected) {
                     viewModelScope.launch {
                         isVoiceInteractionActive = true
                         refreshVoiceAutoKeyboardSuppression()
-                        triggerTvGoogleAssistant()
+                        if (!isEditableTvImeActive()) {
+                            triggerTvGoogleAssistant()
+                        }
                         showMessage("TV 구글 어시스턴트 실행 — 휴대폰 음성 인식으로 전환합니다.")
                         voiceFallbackChannel.trySend(Unit)
                     }
@@ -1314,6 +1473,7 @@ class RemoteViewModel(
             is TvVoiceManager.VoiceEvent.Error -> {
                 _isVoiceListening.value = false
                 if (event.recoverableWithFallback && remoteClient.isConnected) {
+                    tvVoiceSessionUnsupported = true
                     isVoiceInteractionActive = true
                     refreshVoiceAutoKeyboardSuppression()
                     showMessage("${event.message} 휴대폰 음성 인식으로 전환합니다.")
@@ -1349,6 +1509,7 @@ class RemoteViewModel(
         voiceFallbackWatchdogJob?.cancel()
         voiceFallbackWatchdogJob = null
         isVoiceFallbackActive = false
+        isVoiceFallbackAwaitingResults = false
         suppressNextFallbackError = false
         voiceStreamer.stop()
         activeVoiceSessionId = null
@@ -1414,6 +1575,7 @@ class RemoteViewModel(
 
                 if (sessionId == null) {
                     // TV did not open a Protocol v2 RemoteVoiceBegin stream; release mic & fall back to SpeechRecognizer
+                    tvVoiceSessionUnsupported = true
                     voiceBeginDeferred = null
                     voiceStreamer.stopAndJoin()
                     _isVoiceListening.value = false
@@ -1494,6 +1656,7 @@ class RemoteViewModel(
         voiceSessionJob?.cancel()
         voiceSessionJob = null
         isVoiceFallbackActive = false
+        isVoiceFallbackAwaitingResults = false
         voiceFallbackWatchdogJob?.cancel()
         voiceFallbackWatchdogJob = null
         if (wasFallbackActive) {
@@ -1534,6 +1697,7 @@ class RemoteViewModel(
         val suppressed = suppressNextFallbackError
         suppressNextFallbackError = false
         isVoiceFallbackActive = false
+        isVoiceFallbackAwaitingResults = false
         voiceFallbackWatchdogJob?.cancel()
         voiceFallbackWatchdogJob = null
         _isVoiceListening.value = false
@@ -1556,6 +1720,7 @@ class RemoteViewModel(
 
     fun onVoiceSearchRecognized(spokenText: String) {
         isVoiceFallbackActive = false
+        isVoiceFallbackAwaitingResults = false
         voiceFallbackWatchdogJob?.cancel()
         voiceFallbackWatchdogJob = null
         suppressNextFallbackError = false
@@ -1575,21 +1740,27 @@ class RemoteViewModel(
         refreshVoiceAutoKeyboardSuppression()
         viewModelScope.launch {
             try {
-                var imeActive = remoteClient.isImeFieldActive || _imePromptState.value.isTvImeVisible
+                var imeActive = isEditableTvImeActive()
                 if (!imeActive) {
-                    // Open TV search and wait until the TV actually reports a focused text field
+                    // Open TV search and wait until the TV actually reports an editable non-Katniss text field
                     runCatching {
                         remoteClient.sendKey(TvKeyCodes.SEARCH, AndroidTvRemoteClient.DIRECTION_SHORT)
                     }
-                    imeActive = awaitTvImeField(VOICE_IME_WAIT_MS) ||
-                        remoteClient.isImeFieldActive ||
-                        _imePromptState.value.isTvImeVisible
+                    imeActive = awaitTvImeField(VOICE_IME_WAIT_MS) || isEditableTvImeActive()
                 }
-                if (!imeActive && adbClient.isConnected) {
-                    val assistantSearch = adbClient.submitGoogleAssistantQuery(spokenText)
-                    if (assistantSearch.isSuccess) {
-                        showMessage("\"$spokenText\" 어시스턴트 음성 검색 실행")
-                        return@launch
+                if (!imeActive) {
+                    if (!adbClient.isConnected &&
+                        adbClient.adbState.value == AdbConnectionState.DISCONNECTED &&
+                        !connectedHost.isNullOrBlank()
+                    ) {
+                        adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
+                    }
+                    if (adbClient.isConnected) {
+                        val assistantSearch = adbClient.submitGoogleAssistantQuery(spokenText)
+                        if (assistantSearch.isSuccess) {
+                            showMessage("\"$spokenText\" 어시스턴트 음성 검색 실행")
+                            return@launch
+                        }
                     }
                 }
                 val done = CompletableDeferred<Boolean>()
@@ -1618,7 +1789,7 @@ class RemoteViewModel(
 
     private suspend fun awaitTvImeField(timeoutMs: Long): Boolean =
         withTimeoutOrNull(timeoutMs) {
-            _imePromptState.first { it.isTvImeVisible }
+            _imePromptState.first { it.isTvImeVisible && !remoteClient.isKatnissForeground }
         } != null
 
     companion object {
@@ -1628,6 +1799,10 @@ class RemoteViewModel(
         internal const val VOICE_STREAM_MAX_MS = 10_000L
         internal const val VOICE_AUTO_KEYBOARD_GRACE_MS = 5_000L
         internal const val VOICE_IME_WAIT_MS = 1_500L
+        internal const val VOICE_FALLBACK_RESULT_WAIT_MS = 5_000L
+        internal const val VOICE_RMS_ACTIVE_DB_THRESHOLD = 3.0f
+        internal const val VOICE_RMS_REARM_THROTTLE_MS = 250L
+        internal const val BATCH_EDIT_ERROR_FALLBACK_WINDOW_MS = 2_500L
         internal const val TV_EOS_GRACE_MS = 1_200L
         internal const val KEYBOARD_DISMISS_SUPPRESS_MS = 2_000L
     }
@@ -1815,6 +1990,8 @@ class RemoteViewModel(
         connected: Boolean,
         sink: ((ByteArray) -> Unit)?
     ) {
+        tvVoiceSessionUnsupported = false
+        lastBatchEditAttempt = null
         remoteClient.testRawBytesSink = sink
         remoteClient.setConnectedForTest(connected)
     }

@@ -142,10 +142,14 @@ class MainActivity : ComponentActivity() {
                     val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                         putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
+                        putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
                         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3_000L)
+                        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 3_000L)
                     }
                     viewModel.onVoiceFallbackStarted()
+                    runCatching { speechRecognizer.cancel() }
                     runCatching { speechRecognizer.startListening(intent) }
                         .onFailure {
                             viewModel.onVoiceFallbackFinished("음성 인식을 시작할 수 없습니다: ${it.message}")
@@ -173,10 +177,12 @@ class MainActivity : ComponentActivity() {
                         override fun onBeginningOfSpeech() {
                             viewModel.reportVoiceSpeechStarted()
                         }
-                        override fun onRmsChanged(rmsdB: Float) = Unit
+                        override fun onRmsChanged(rmsdB: Float) {
+                            viewModel.reportVoiceRmsChanged(rmsdB)
+                        }
                         override fun onBufferReceived(buffer: ByteArray?) = Unit
                         override fun onEndOfSpeech() {
-                            viewModel.setVoiceListening(false)
+                            viewModel.reportVoiceEndOfSpeech()
                         }
                         override fun onError(error: Int) {
                             val msg = when (error) {

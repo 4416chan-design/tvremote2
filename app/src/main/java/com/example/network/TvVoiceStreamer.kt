@@ -420,7 +420,7 @@ class TvVoiceStreamer internal constructor(
         const val CHUNK_BYTES = 1600
         const val MIN_PAYLOAD_BYTES = VoiceChunkAccumulator.MIN_PAYLOAD_BYTES
         const val MAX_PAYLOAD_BYTES = VoiceChunkAccumulator.MAX_PAYLOAD_BYTES
-        internal const val SPEECH_PEAK_THRESHOLD = 600
+        internal const val SPEECH_PEAK_THRESHOLD = 2_000
         private const val FINISH_JOIN_TIMEOUT_MS = 450L
 
         internal fun computePcm16PeakAmplitude(pcmLeBytes: ByteArray): Int {

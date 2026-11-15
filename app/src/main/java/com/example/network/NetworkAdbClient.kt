@@ -873,7 +873,11 @@ class NetworkAdbClient(
                 append("OUT=\$(am start -a android.search.action.GLOBAL_SEARCH --es query '$escaped' 2>&1); ")
                 append("RC=\$?; ")
                 append("if [ \"\$RC\" -ne 0 ] || echo \"\$OUT\" | grep -qiE \"Error:|Exception|unable to resolve|No Activity\"; then ")
-                append("am start -a android.intent.action.SEARCH --es query '$escaped' 2>&1; ")
+                append("OUT=\$(am start -a android.intent.action.SEARCH --es query '$escaped' 2>&1); ")
+                append("RC=\$?; ")
+                append("fi; ")
+                append("if [ \"\$RC\" -ne 0 ] || echo \"\$OUT\" | grep -qiE \"Error:|Exception|unable to resolve|No Activity\"; then ")
+                append("am start -a android.intent.action.WEB_SEARCH --es query '$escaped' 2>&1; ")
                 append("fi")
             }
         }
