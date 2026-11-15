@@ -6,6 +6,7 @@ plugins {
   alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.secrets)
   alias(libs.plugins.google.services)
+  alias(libs.plugins.google.protobuf)
 }
 
 android {
@@ -80,6 +81,21 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
+protobuf {
+  protoc {
+    artifact = "com.google.protobuf:protoc:${libs.versions.protobufJavalite.get()}"
+  }
+  generateProtoTasks {
+    all().forEach { task ->
+      task.builtins {
+        create("java") {
+          option("lite")
+        }
+      }
+    }
+  }
+}
+
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
 dependencies {
@@ -121,6 +137,7 @@ dependencies {
   // implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
+  implementation(libs.protobuf.javalite)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

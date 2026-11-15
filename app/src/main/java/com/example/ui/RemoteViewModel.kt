@@ -25,6 +25,7 @@ import com.example.network.AndroidTvRemoteClient
 import com.example.network.ClientCertStore
 import com.example.network.NetworkAdbClient
 import com.example.network.TvDiscoveryManager
+import com.example.network.TvVoiceManager
 import com.example.network.TvVoiceStreamer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -153,6 +154,27 @@ class RemoteViewModel(
     private var lastAdbSentTextLength: Int = 0
 
     private val voiceStreamer = TvVoiceStreamer()
+    private val hardwareVoiceRecorder = TvVoiceManager.HardwareAudioRecordRecorder()
+
+    @Volatile
+    private var pushToTalkPcmRecorderOverride: TvVoiceManager.VoicePcmRecorder? = null
+
+    private val voiceManager: TvVoiceManager by lazy {
+        TvVoiceManager(
+            transport = TvVoiceManager.SharedRemoteClientTransport(remoteClient),
+            pcmRecorder = TvVoiceManager.VoicePcmRecorder { bufferSizeBytes, isActive, onPcmChunk ->
+                val recorder = pushToTalkPcmRecorderOverride ?: hardwareVoiceRecorder
+                recorder.record(bufferSizeBytes, isActive, onPcmChunk)
+            },
+            onSpeechDetected = {
+                lastVoiceActivityAtMs = System.currentTimeMillis()
+            },
+            onEvent = { event ->
+                handleVoiceManagerEvent(event)
+            }
+        )
+    }
+
     private val voiceFallbackChannel = Channel<Unit>(Channel.BUFFERED)
     val voiceFallbackRequests: Flow<Unit> = voiceFallbackChannel.receiveAsFlow()
     private val voiceStopChannel = Channel<Unit>(Channel.BUFFERED)
@@ -253,6 +275,7 @@ class RemoteViewModel(
             lastVoiceActivityAtMs = System.currentTimeMillis()
             isVoiceInteractionActive = true
             refreshVoiceAutoKeyboardSuppression()
+            voiceManager.onTvVoiceBegin(sessionId)
             voiceBeginDeferred?.complete(sessionId)
         },
         onVoicePayloadAck = { sessionId ->
@@ -263,28 +286,38 @@ class RemoteViewModel(
             }
         },
         onVoiceEndRequested = { sessionId ->
-            if (activeVoiceSessionId == sessionId || activeVoiceSessionId != null) {
+            if (voiceManager.state.value != TvVoiceManager.State.IDLE) {
+                voiceEndedByTv = true
+                voiceManager.onTvVoiceEnd(sessionId)
+                refreshVoiceAutoKeyboardSuppression()
+            } else if (activeVoiceSessionId == sessionId || activeVoiceSessionId != null) {
                 voiceEndedByTv = true
                 refreshVoiceAutoKeyboardSuppression()
                 stopVoiceSession(sendEndPacket = false)
             }
         },
         onRemoteErrorInfo = { errInfo ->
-            val voiceInFlight = _isVoiceListening.value ||
+            val pttInFlight = voiceManager.state.value != TvVoiceManager.State.IDLE
+            val voiceInFlight = pttInFlight ||
+                _isVoiceListening.value ||
                 activeVoiceSessionId != null ||
                 voiceFinalizeJob?.isActive == true
             if (errInfo.offendingFieldNumber in 30..32 && voiceInFlight) {
-                viewModelScope.launch {
-                    stopVoiceSession(sendEndPacket = false, keepVoiceSuppressionForFallback = true)
-                    _isVoiceListening.value = false
-                    voiceStreamer.stopAndJoin()
-                    if (remoteClient.isConnected) {
-                        isVoiceInteractionActive = true
-                        refreshVoiceAutoKeyboardSuppression()
-                        showMessage("${errInfo.detail} 휴대폰 음성 인식으로 전환합니다.")
-                        voiceFallbackChannel.trySend(Unit)
-                    } else {
-                        isVoiceInteractionActive = false
+                if (pttInFlight) {
+                    voiceManager.onTvVoiceError(errInfo.detail, recoverableWithFallback = true)
+                } else {
+                    viewModelScope.launch {
+                        stopVoiceSession(sendEndPacket = false, keepVoiceSuppressionForFallback = true)
+                        _isVoiceListening.value = false
+                        voiceStreamer.stopAndJoin()
+                        if (remoteClient.isConnected) {
+                            isVoiceInteractionActive = true
+                            refreshVoiceAutoKeyboardSuppression()
+                            showMessage("${errInfo.detail} 휴대폰 음성 인식으로 전환합니다.")
+                            voiceFallbackChannel.trySend(Unit)
+                        } else {
+                            isVoiceInteractionActive = false
+                        }
                     }
                 }
             } else if (errInfo.detail.isNotBlank()) {
@@ -292,6 +325,7 @@ class RemoteViewModel(
             }
         },
         onDisconnected = { cause ->
+            voiceManager.cancel()
             stopVoiceSession(sendEndPacket = false)
             clearVoiceAutoKeyboardSuppression()
             adbConnectJob?.cancel()
@@ -408,6 +442,7 @@ class RemoteViewModel(
      * a half-open zombie socket that triggers a fresh 6-digit PIN handshake on return.
      */
     fun onAppBackgrounded() {
+        voiceManager.cancel()
         stopVoiceSession(sendEndPacket = false)
         clearVoiceAutoKeyboardSuppression()
         _isKeyboardSheetVisible.value = false
@@ -602,6 +637,7 @@ class RemoteViewModel(
     }
 
     fun disconnectTv() {
+        voiceManager.cancel()
         stopVoiceSession(sendEndPacket = false)
         clearVoiceAutoKeyboardSuppression()
         _isKeyboardSheetVisible.value = false
@@ -620,6 +656,7 @@ class RemoteViewModel(
         viewModelScope.launch {
             val active = _connectionState.value
             if (active is TvConnectionState.Connected && active.host == host) {
+                voiceManager.cancel()
                 stopVoiceSession(sendEndPacket = false)
                 clearVoiceAutoKeyboardSuppression()
                 _isKeyboardSheetVisible.value = false
@@ -1166,6 +1203,125 @@ class RemoteViewModel(
     }
 
     /**
+     * Push-to-Talk (`MotionEvent.ACTION_DOWN`):
+     * Delegates to [TvVoiceManager.onPressDown] for strict Protocol v2 handshake:
+     * `KEYCODE_SEARCH (84)` -> TV `RemoteVoiceBegin(session_id)` ->
+     * `RemoteVoiceBegin(session_id, RemoteVoiceConfig(8000, 1, 2))` -> `AudioRecord` PCM stream.
+     */
+    fun startPushToTalkVoiceSession() {
+        if (!ensureConnectedOrPrompt()) return
+        _isKeyboardSheetVisible.value = false
+        voiceSessionJob?.cancel()
+        voiceSessionJob = null
+        voiceFinalizeJob?.cancel()
+        voiceFinalizeJob = null
+        voiceFallbackWatchdogJob?.cancel()
+        voiceFallbackWatchdogJob = null
+        isVoiceFallbackActive = false
+        suppressNextFallbackError = false
+        voiceStreamer.stop()
+        activeVoiceSessionId = null
+        voiceEndedByTv = false
+        tvVoiceEosDetectedAtMs = null
+        lastVoiceActivityAtMs = System.currentTimeMillis()
+        isVoiceInteractionActive = true
+        refreshVoiceAutoKeyboardSuppression()
+
+        if (remoteClient.isVoiceSupportedByTv == false) {
+            _isVoiceListening.value = false
+            voiceSessionJob = viewModelScope.launch {
+                val assistantOpened = triggerTvGoogleAssistant()
+                refreshVoiceAutoKeyboardSuppression(VOICE_AUTO_KEYBOARD_GRACE_MS)
+                if (assistantOpened) {
+                    showMessage("TV 구글 어시스턴트 실행 — 휴대폰 마이크로 말씀하세요.")
+                } else {
+                    showMessage("TV 직접 마이크 미지원 — 휴대폰 음성 인식으로 검색합니다.")
+                }
+                voiceFallbackChannel.trySend(Unit)
+            }
+            return
+        }
+
+        voiceManager.onPressDown(viewModelScope)
+    }
+
+    /**
+     * Push-to-Talk (`MotionEvent.ACTION_UP` / `ACTION_CANCEL`):
+     * Stops `AudioRecord`, flushes remaining PCM, and sends `RemoteVoiceEnd(session_id)`.
+     */
+    fun stopPushToTalkVoiceSession() {
+        if (isVoiceFallbackActive) {
+            stopVoiceSession(sendEndPacket = true)
+            return
+        }
+        voiceManager.onReleaseUp()
+    }
+
+    private fun handleVoiceManagerEvent(event: TvVoiceManager.VoiceEvent) {
+        when (event) {
+            is TvVoiceManager.VoiceEvent.StateChanged -> {
+                when (event.state) {
+                    TvVoiceManager.State.WAITING_FOR_SESSION,
+                    TvVoiceManager.State.STREAMING -> {
+                        _isVoiceListening.value = true
+                        isVoiceInteractionActive = true
+                        refreshVoiceAutoKeyboardSuppression(VOICE_STREAM_MAX_MS + VOICE_AUTO_KEYBOARD_GRACE_MS)
+                    }
+                    TvVoiceManager.State.STOPPING -> {
+                        _isVoiceListening.value = false
+                    }
+                    TvVoiceManager.State.IDLE -> {
+                        if (!isVoiceFallbackActive && voiceSessionJob?.isActive != true) {
+                            _isVoiceListening.value = false
+                            isVoiceInteractionActive = false
+                            refreshVoiceAutoKeyboardSuppression()
+                        }
+                    }
+                }
+            }
+            is TvVoiceManager.VoiceEvent.SessionStarted -> {
+                activeVoiceSessionId = event.sessionId
+                voiceEndedByTv = false
+                refreshVoiceAutoKeyboardSuppression(VOICE_STREAM_MAX_MS + VOICE_AUTO_KEYBOARD_GRACE_MS)
+                showMessage("TV 음성 스트리밍 중 — 버튼에서 손을 떼면 종료됩니다.")
+            }
+            is TvVoiceManager.VoiceEvent.SessionEnded -> {
+                if (activeVoiceSessionId == event.sessionId) {
+                    activeVoiceSessionId = null
+                }
+                _isVoiceListening.value = false
+                refreshVoiceAutoKeyboardSuppression()
+            }
+            is TvVoiceManager.VoiceEvent.VoiceBeginTimeout -> {
+                _isVoiceListening.value = false
+                if (remoteClient.isConnected) {
+                    viewModelScope.launch {
+                        isVoiceInteractionActive = true
+                        refreshVoiceAutoKeyboardSuppression()
+                        triggerTvGoogleAssistant()
+                        showMessage("TV 구글 어시스턴트 실행 — 휴대폰 음성 인식으로 전환합니다.")
+                        voiceFallbackChannel.trySend(Unit)
+                    }
+                } else {
+                    isVoiceInteractionActive = false
+                }
+            }
+            is TvVoiceManager.VoiceEvent.Error -> {
+                _isVoiceListening.value = false
+                if (event.recoverableWithFallback && remoteClient.isConnected) {
+                    isVoiceInteractionActive = true
+                    refreshVoiceAutoKeyboardSuppression()
+                    showMessage("${event.message} 휴대폰 음성 인식으로 전환합니다.")
+                    voiceFallbackChannel.trySend(Unit)
+                } else {
+                    isVoiceInteractionActive = false
+                    showMessage(event.message)
+                }
+            }
+        }
+    }
+
+    /**
      * Initiates Android TV Google Assistant + voice input:
      * 1) Dismisses mobile keyboard sheet & suppresses autoShowKeyboard popups triggered by Katniss/Assistant
      * 2) Launches TV Google Assistant even when `FEATURE_VOICE` is omitted (`tvFeatures = 615`), then starts SpeechRecognizer fallback
@@ -1676,6 +1832,11 @@ class RemoteViewModel(
                 fn(frameBytes, isRunning, onFrame)
             }
         }
+        pushToTalkPcmRecorderOverride = backend?.let { fn ->
+            TvVoiceManager.VoicePcmRecorder { bufferSizeBytes, isActive, onPcmChunk ->
+                fn(bufferSizeBytes, isActive, onPcmChunk)
+            }
+        }
     }
 
     internal suspend fun applyRemoteFieldsForTest(fields: List<com.example.network.ProtobufWire.Field>) {
@@ -1698,6 +1859,7 @@ class RemoteViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        voiceManager.cancel()
         stopVoiceSession(sendEndPacket = false)
         clearVoiceAutoKeyboardSuppression()
         connectJob?.cancel()

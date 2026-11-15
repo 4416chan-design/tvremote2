@@ -216,17 +216,24 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                var isMicTouchHeld by remember { mutableStateOf(false) }
+
                 val micPermissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestPermission()
                 ) { granted ->
                     if (granted) {
-                        viewModel.startVoiceSession()
+                        if (isMicTouchHeld) {
+                            viewModel.startPushToTalkVoiceSession()
+                        } else {
+                            viewModel.showMessage("마이크 권한이 허용되었습니다. 마이크 버튼을 누른 채 말씀하세요.")
+                        }
                     } else {
+                        isMicTouchHeld = false
                         viewModel.triggerTvVoiceAssistWithoutMic()
                     }
                 }
 
-                fun handleMicClick() {
+                fun handleMicTouchDown() {
                     if (connectionState !is TvConnectionState.Connected) {
                         viewModel.showMessage("먼저 상단 TV 선택 버튼에서 Wi-Fi TV를 연결해 주세요.")
                         viewModel.openTvPicker()
@@ -237,13 +244,18 @@ class MainActivity : ComponentActivity() {
                         Manifest.permission.RECORD_AUDIO
                     ) == PackageManager.PERMISSION_GRANTED
                     if (hasAudioPermission) {
-                        if (isVoiceListening) {
-                            viewModel.stopVoiceSession(sendEndPacket = true)
-                        } else {
-                            viewModel.startVoiceSession()
-                        }
+                        isMicTouchHeld = true
+                        viewModel.startPushToTalkVoiceSession()
                     } else {
+                        isMicTouchHeld = false
                         micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+
+                fun handleMicTouchUp() {
+                    if (isMicTouchHeld) {
+                        isMicTouchHeld = false
+                        viewModel.stopPushToTalkVoiceSession()
                     }
                 }
 
@@ -266,7 +278,8 @@ class MainActivity : ComponentActivity() {
                             onKeyPress = viewModel::sendKey,
                             onLaunchFavorite = viewModel::launchFavorite,
                             onOpenKeyboard = viewModel::openKeyboardSheet,
-                            onMicClick = ::handleMicClick,
+                            onMicTouchDown = ::handleMicTouchDown,
+                            onMicTouchUp = ::handleMicTouchUp,
                             onOpenSettings = { navController.navigate(ROUTE_SETTINGS) },
                             onToggleMute = viewModel::toggleMute,
                             onStepVolume = viewModel::stepVolume,

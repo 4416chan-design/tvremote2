@@ -585,6 +585,8 @@ class AndroidTvRemoteClient(
         }
     }
 
+    suspend fun sendDelimitedFrame(framedBytes: ByteArray) = sendFramedBytes(framedBytes)
+
     private suspend fun sendRaw(payload: ByteArray) = sendFramedBytes(ProtobufWire.frameMessage(payload))
 
     private suspend fun sendFramedBytes(framedBytes: ByteArray) = withContext(Dispatchers.IO) {
@@ -686,24 +688,14 @@ class AndroidTvRemoteClient(
             return sessionId to packageName
         }
 
-        fun buildVoiceBeginPayload(sessionId: Int): ByteArray = ProtobufWire.encode {
-            writeMessageField(30) { // remote_voice_begin
-                writeVarintField(1, sessionId)
-            }
-        }
+        fun buildVoiceBeginPayload(sessionId: Int): ByteArray =
+            TvVoiceManager.buildVoiceBeginReplyMessage(sessionId).toByteArray()
 
-        fun buildVoicePayload(sessionId: Int, pcmSamples: ByteArray): ByteArray = ProtobufWire.encode {
-            writeMessageField(31) { // remote_voice_payload
-                writeVarintField(1, sessionId)
-                writeBytesField(2, pcmSamples)
-            }
-        }
+        fun buildVoicePayload(sessionId: Int, pcmSamples: ByteArray): ByteArray =
+            TvVoiceManager.buildVoicePayloadMessage(sessionId, pcmSamples).toByteArray()
 
-        fun buildVoiceEndPayload(sessionId: Int): ByteArray = ProtobufWire.encode {
-            writeMessageField(32) { // remote_voice_end
-                writeVarintField(1, sessionId)
-            }
-        }
+        fun buildVoiceEndPayload(sessionId: Int): ByteArray =
+            TvVoiceManager.buildVoiceEndMessage(sessionId).toByteArray()
 
         fun buildImeBatchEditPayload(
             imeCounter: Int,
