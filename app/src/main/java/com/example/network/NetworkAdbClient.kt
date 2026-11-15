@@ -1,5 +1,10 @@
 package com.example.network
 
+import com.example.data.model.TvImeKeycodeMap
+import com.example.data.model.TvImeStatus
+import com.example.data.model.TvImeType
+import com.example.data.model.TvKeyboardLanguage
+import com.example.data.model.TvKeyCodes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,7 +49,7 @@ data class AdbAppLaunchResult(
 
 /**
  * Lightweight pure-Kotlin ADB-over-TCP (port 5555) client supporting RSA authentication,
- * shell command execution, ADBKeyBoard text broadcasts, ADB sync APK upload, and TV app launches.
+ * shell command execution, TV IME language inspection, key/text injection, and TV app launches.
  */
 class NetworkAdbClient(
     private val keyManager: AdbKeyManager
@@ -77,9 +82,6 @@ class NetworkAdbClient(
     private var lastVerifiedHardwareBacklightSupport: Boolean? = null
 
     @Volatile
-    private var adbKeyboardInstalled: Boolean? = null
-
-    @Volatile
     internal var testShellRunner: (suspend (String) -> Result<String>)? = null
 
     val isConnected: Boolean
@@ -92,7 +94,6 @@ class NetworkAdbClient(
         shellRunner: (suspend (String) -> Result<String>)?
     ) {
         testShellRunner = shellRunner
-        adbKeyboardInstalled = null
         _adbState.value = if (connected) AdbConnectionState.CONNECTED else AdbConnectionState.DISCONNECTED
         _adbStatusDetail.value = if (connected) "ADB 테스트 연결됨" else null
     }
@@ -106,7 +107,6 @@ class NetworkAdbClient(
             } else {
                 closeSocketOnly()
                 lastVerifiedHardwareBacklightSupport = null
-                adbKeyboardInstalled = null
                 peerMaxPayload = MAX_PAYLOAD
                 _adbState.value = AdbConnectionState.CONNECTING
                 _adbStatusDetail.value = "TV ADB(5555) 연결 시도 중..."
@@ -352,10 +352,8 @@ class NetworkAdbClient(
     }
 
     /**
-     * Sends text via ADB shell:
-     * - When ADBKeyBoard is installed: delegates to [sendViaAdbKeyboard] (supports clear + ASCII/UTF-8).
-     * - Otherwise for ASCII text: uses `input text` (with proper `%s` space and POSIX shell escaping).
-     * - Otherwise returns failure with [ADB_UNICODE_UNSUPPORTED].
+     * Sends text via ADB shell using raw `input text` (with `%s` space and POSIX shell escaping)
+     * or returns [ADB_UNICODE_UNSUPPORTED] for non-ASCII strings.
      */
     suspend fun sendInputText(
         text: String,
@@ -364,14 +362,6 @@ class NetworkAdbClient(
     ): Result<Unit> {
         if (!isConnected) {
             return Result.failure(IllegalStateException("ADB 미연결"))
-        }
-
-        if (hasAdbKeyboardIme()) {
-            return sendViaAdbKeyboard(
-                text = text,
-                clearExisting = clearCount > 0,
-                submitWithEnter = submitWithEnter
-            )
         }
 
         if (text.isEmpty()) {
@@ -399,37 +389,6 @@ class NetworkAdbClient(
         return Result.failure(UnsupportedOperationException(ADB_UNICODE_UNSUPPORTED))
     }
 
-    /**
-     * Clears (optional) and commits text on TV using ADBKeyBoard (`com.android.adbkeyboard/.AdbIME`):
-     * - Clear: `am broadcast -a ADB_CLEAR_TEXT`
-     * - ASCII text: `am broadcast -a ADB_INPUT_TEXT --es msg '...'`
-     * - Korean / Unicode text (per README section 1.1 for Oreo+): `am broadcast -a ADB_INPUT_B64 --es msg '<b64>'`
-     */
-    suspend fun sendViaAdbKeyboard(
-        text: String,
-        clearExisting: Boolean = true,
-        submitWithEnter: Boolean = false
-    ): Result<Unit> {
-        if (!isConnected) {
-            return Result.failure(IllegalStateException("ADB 미연결"))
-        }
-        val cmd = buildAdbKeyboardSendCommand(
-            text = text,
-            clearExisting = clearExisting,
-            submitWithEnter = submitWithEnter
-        ) ?: return Result.success(Unit)
-
-        val res = shell(cmd, timeoutMs = 12_000L)
-        if (res.isFailure) {
-            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("ADBKeyBoard 전송 실패"))
-        }
-        val out = res.getOrDefault("")
-        if (out.contains("Error:", ignoreCase = true) || out.contains("Exception", ignoreCase = true)) {
-            return Result.failure(IllegalStateException(out))
-        }
-        return Result.success(Unit)
-    }
-
     suspend fun clearTextField(count: Int = 20, submitWithEnter: Boolean = false): Result<Unit> {
         if (!isConnected) {
             return Result.failure(IllegalStateException("ADB 미연결"))
@@ -451,248 +410,54 @@ class NetworkAdbClient(
         return Result.success(Unit)
     }
 
-    suspend fun checkAdbKeyboardInstalled(forceRefresh: Boolean = false): Boolean? {
-        if (!isConnected) return null
-        if (!forceRefresh && adbKeyboardInstalled != null) return adbKeyboardInstalled
-
-        val checkCmd = buildAdbKeyboardCheckShellCommand()
-        val res = shell(checkCmd, timeoutMs = 8_000L)
-        if (res.isFailure) return null
-        val out = res.getOrDefault("")
-        val installed = when {
-            out.contains("ADBKB=INSTALLED") ||
-                out.contains(ADB_KEYBOARD_IME_ID, ignoreCase = true) -> true
-            out.contains("ADBKB=MISSING") -> false
-            else -> null
-        }
-        if (installed != null) {
-            adbKeyboardInstalled = installed
-        }
-        return installed
-    }
-
-    suspend fun hasAdbKeyboardIme(forceRefresh: Boolean = false): Boolean {
-        return checkAdbKeyboardInstalled(forceRefresh) == true
-    }
-
-    /**
-     * Checks TV's Download folder for `keyboardservice-debug.apk` (installing or opening it on TV)
-     * or opens the TV's Downloads UI.
-     */
-    suspend fun openDownloadFolderOnTv(): Result<String> {
+    suspend fun sendKeyCombination(vararg keyCodes: Int): Result<Unit> {
         if (!isConnected) {
             return Result.failure(IllegalStateException("ADB 미연결"))
         }
-        val cmd = buildString {
-            append("APK=\"\"; ")
-            append("for p in /sdcard/Download/keyboardservice-debug.apk /storage/emulated/0/Download/keyboardservice-debug.apk; do ")
-            append("if [ -f \"\$p\" ]; then APK=\"\$p\"; break; fi; ")
-            append("done; ")
-            append("if [ -n \"\$APK\" ]; then ")
-            append("OUT=\$(pm install -r -d \"\$APK\" 2>&1); ")
-            append("if echo \"\$OUT\" | grep -qi \"Success\"; then ")
-            append("ime enable $ADB_KEYBOARD_IME_ID >/dev/null 2>&1; ")
-            append("echo \"TV_DL=INSTALLED|\$APK\"; ")
-            append("else ")
-            append("ACT=\$(am start -a android.intent.action.VIEW -d \"file://\$APK\" -t \"application/vnd.android.package-archive\" --activity-new-task 2>&1); ")
-            append("echo \"TV_DL=OPENED_APK|\$APK|\$ACT\"; ")
-            append("fi; ")
-            append("else ")
-            append("ACT=\$(am start -a android.intent.action.VIEW_DOWNLOADS 2>&1 || am start -a android.intent.action.VIEW -d \"content://com.android.externalstorage.documents/document/primary%3ADownload\" 2>&1); ")
-            append("echo \"TV_DL=OPENED_FOLDER|\$ACT\"; ")
-            append("fi")
+        val cmd = buildKeyCombinationShellCommand(*keyCodes)
+            ?: return Result.failure(IllegalArgumentException("유효하지 않은 키 조합"))
+        val res = shell(cmd)
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("ADB 키 조합 전송 실패"))
         }
-        val res = shell(cmd, timeoutMs = 30_000L)
-        if (res.isSuccess && res.getOrDefault("").contains("TV_DL=INSTALLED")) {
-            adbKeyboardInstalled = true
+        val out = res.getOrDefault("")
+        if (out.contains("Error:", ignoreCase = true) || out.contains("Exception", ignoreCase = true)) {
+            return Result.failure(IllegalStateException(out))
         }
-        return res
+        return Result.success(Unit)
     }
 
     /**
-     * Uploads an APK from the phone (e.g. downloaded `keyboardservice-debug.apk`) to the TV via ADB sync
-     * and installs + enables `com.android.adbkeyboard/.AdbIME`.
+     * Executes "(1) Select All (Ctrl+A) -> (2) Delete (DEL)" via ADB `input keycombination`,
+     * falling back to `MOVE_END + DEL`s on Android TV builds without `keycombination`.
      */
-    suspend fun installApkBytesOnTv(apkBytes: ByteArray): Result<Unit> {
-        if (apkBytes.size < 4 || apkBytes[0] != 'P'.code.toByte() || apkBytes[1] != 'K'.code.toByte()) {
-            return Result.failure(IllegalArgumentException("올바른 APK 파일(keyboardservice-debug.apk)이 아닙니다."))
-        }
+    suspend fun selectAllAndDelete(): Result<Unit> {
         if (!isConnected) {
-            return Result.failure(IllegalStateException("ADB가 연결되어 있지 않습니다."))
+            return Result.failure(IllegalStateException("ADB 미연결"))
         }
-        val pushRes = pushFileViaSync(TV_APK_TEMP_PATH, apkBytes, timeoutMs = 45_000L)
-        if (pushRes.isFailure) {
-            return Result.failure(pushRes.exceptionOrNull() ?: IllegalStateException("TV로 APK 전송 실패"))
+        val res = shell(buildSelectAllAndDeleteShellCommand(), timeoutMs = 6_000L)
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("전체 지우기 실패"))
         }
-
-        val installCmd = buildString {
-            append("OUT=\$(pm install -r -d $TV_APK_TEMP_PATH 2>&1); ")
-            append("rm -f $TV_APK_TEMP_PATH >/dev/null 2>&1; ")
-            append("if echo \"\$OUT\" | grep -qi \"Success\"; then ")
-            append("ime enable $ADB_KEYBOARD_IME_ID >/dev/null 2>&1; ")
-            append("echo \"INSTALL=OK|\$OUT\"; ")
-            append("else ")
-            append("echo \"INSTALL=FAIL|\$OUT\"; ")
-            append("fi")
+        val out = res.getOrDefault("")
+        if (out.contains("Error:", ignoreCase = true) || out.contains("Exception", ignoreCase = true)) {
+            return Result.failure(IllegalStateException(out))
         }
-        val installRes = shell(installCmd, timeoutMs = 45_000L)
-        if (installRes.isFailure) {
-            return Result.failure(installRes.exceptionOrNull() ?: IllegalStateException("TV 앱 설치 명령 실패"))
-        }
-        val out = installRes.getOrDefault("")
-        return if (out.startsWith("INSTALL=OK")) {
-            adbKeyboardInstalled = true
-            Result.success(Unit)
-        } else {
-            val detail = out.substringAfter("INSTALL=FAIL|", out).trim().ifBlank { "pm install 실패" }
-            Result.failure(IllegalStateException("TV 설치 실패: $detail"))
-        }
+        return Result.success(Unit)
     }
 
     /**
-     * Pushes a byte array to [remotePath] over the ADB `sync:` stream service (`SEND`/`DATA`/`DONE`/`QUIT`).
+     * Reads the active Android TV IME ID and Korean/English subtype language via ADB shell.
      */
-    suspend fun pushFileViaSync(
-        remotePath: String,
-        data: ByteArray,
-        timeoutMs: Long = 30_000L
-    ): Result<Unit> = withContext(Dispatchers.IO) {
-        ioMutex.withLock {
-            val out = output
-            val inp = input
-            val sock = socket
-            if (out == null || inp == null || sock == null || sock.isClosed) {
-                _adbState.value = AdbConnectionState.DISCONNECTED
-                return@withLock Result.failure(IllegalStateException("ADB가 연결되어 있지 않습니다."))
-            }
-
-            try {
-                sock.soTimeout = timeoutMs.coerceIn(2_000L, 120_000L).toInt()
-                val localId = streamIdCounter.getAndIncrement()
-                sendPacket(
-                    out = out,
-                    command = A_OPEN,
-                    arg0 = localId,
-                    arg1 = 0,
-                    data = "sync:\u0000".toByteArray(Charsets.UTF_8)
-                )
-
-                var remoteId = 0
-                while (true) {
-                    val pkt = readPacket(inp)
-                    when (pkt.command) {
-                        A_OKAY -> if (pkt.arg1 == localId) {
-                            remoteId = pkt.arg0
-                            break
-                        }
-                        A_CLSE -> if (pkt.arg1 == localId) {
-                            throw IllegalStateException("TV ADB sync 서비스가 거부되었습니다.")
-                        }
-                        else -> Unit
-                    }
-                }
-
-                val syncReply = ByteArrayOutputStream()
-                var remoteClosed = false
-
-                fun writeChunkAndAwaitOkay(payload: ByteArray) {
-                    sendPacket(out, A_WRTE, localId, remoteId, payload)
-                    while (true) {
-                        val pkt = readPacket(inp)
-                        when (pkt.command) {
-                            A_OKAY -> if (pkt.arg1 == localId) return
-                            A_WRTE -> if (pkt.arg1 == localId) {
-                                if (pkt.data.isNotEmpty()) syncReply.write(pkt.data)
-                                sendPacket(out, A_OKAY, localId, remoteId, ByteArray(0))
-                            }
-                            A_CLSE -> if (pkt.arg1 == localId) {
-                                remoteClosed = true
-                                sendPacket(out, A_CLSE, localId, remoteId, ByteArray(0))
-                                return
-                            }
-                            else -> Unit
-                        }
-                    }
-                }
-
-                writeChunkAndAwaitOkay(buildSyncSpecPacket(remotePath))
-
-                val maxChunkData = minOf(SYNC_DATA_MAX, (peerMaxPayload - 8).coerceAtLeast(1_024))
-                var offset = 0
-                while (offset < data.size) {
-                    val sliceLen = minOf(maxChunkData, data.size - offset)
-                    writeChunkAndAwaitOkay(buildSyncChunkPacket(data, offset, sliceLen))
-                    offset += sliceLen
-                }
-
-                val mtimeSeconds = (System.currentTimeMillis() / 1000L).toInt()
-                writeChunkAndAwaitOkay(buildSyncDonePacket(mtimeSeconds))
-
-                while (!remoteClosed) {
-                    val bytes = syncReply.toByteArray()
-                    if (bytes.size >= 8) {
-                        val tag = String(bytes, 0, 4, Charsets.US_ASCII)
-                        if (tag == "OKAY") {
-                            break
-                        }
-                        if (tag == "FAIL") {
-                            val errLen = ByteBuffer.wrap(bytes, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                            if (bytes.size >= 8 + errLen) {
-                                val errMsg = if (errLen > 0) String(bytes, 8, errLen, Charsets.UTF_8) else "SYNC FAIL"
-                                throw IllegalStateException("ADB 파일 전송 오류: $errMsg")
-                            }
-                        } else {
-                            throw IllegalStateException("알 수 없는 ADB sync 응답: $tag")
-                        }
-                    }
-
-                    val pkt = readPacket(inp)
-                    when (pkt.command) {
-                        A_WRTE -> if (pkt.arg1 == localId) {
-                            if (pkt.data.isNotEmpty()) syncReply.write(pkt.data)
-                            sendPacket(out, A_OKAY, localId, remoteId, ByteArray(0))
-                        }
-                        A_CLSE -> if (pkt.arg1 == localId) {
-                            remoteClosed = true
-                            sendPacket(out, A_CLSE, localId, remoteId, ByteArray(0))
-                        }
-                        else -> Unit
-                    }
-                }
-
-                val finalReply = syncReply.toByteArray()
-                if (finalReply.size < 4 || String(finalReply, 0, 4, Charsets.US_ASCII) != "OKAY") {
-                    throw IllegalStateException("ADB 파일 전송 완료 응답을 받지 못했습니다.")
-                }
-
-                if (!remoteClosed) {
-                    sendPacket(out, A_WRTE, localId, remoteId, buildSyncQuitPacket())
-                    while (true) {
-                        val pkt = readPacket(inp)
-                        when (pkt.command) {
-                            A_OKAY -> if (pkt.arg1 == localId) {
-                                // Drain until peer A_CLSE
-                            }
-                            A_WRTE -> if (pkt.arg1 == localId) {
-                                sendPacket(out, A_OKAY, localId, remoteId, ByteArray(0))
-                            }
-                            A_CLSE -> if (pkt.arg1 == localId || pkt.arg0 == remoteId) {
-                                sendPacket(out, A_CLSE, localId, remoteId, ByteArray(0))
-                                break
-                            }
-                            else -> Unit
-                        }
-                    }
-                }
-
-                Result.success(Unit)
-            } catch (t: Throwable) {
-                closeSocketOnly()
-                _adbState.value = AdbConnectionState.DISCONNECTED
-                _adbStatusDetail.value = "ADB 연결이 끊어졌습니다"
-                Result.failure(t)
-            }
+    suspend fun readTvImeStatus(): Result<TvImeStatus> {
+        if (!isConnected) {
+            return Result.failure(IllegalStateException("ADB 미연결"))
         }
+        val res = shell(buildReadTvImeStatusShellCommand(), timeoutMs = 5_500L)
+        if (res.isFailure) {
+            return Result.failure(res.exceptionOrNull() ?: IllegalStateException("TV IME 상태 조회 실패"))
+        }
+        return Result.success(parseTvImeStatus(res.getOrDefault("")))
     }
 
     /**
@@ -735,7 +500,6 @@ class NetworkAdbClient(
     fun disconnect() {
         connectedHost = null
         lastVerifiedHardwareBacklightSupport = null
-        adbKeyboardInstalled = null
         peerMaxPayload = MAX_PAYLOAD
         closeSocketOnly()
         _adbState.value = AdbConnectionState.DISCONNECTED
@@ -812,18 +576,10 @@ class NetworkAdbClient(
 
     companion object {
         const val DEFAULT_ADB_PORT = 5555
-        const val ADB_KEYBOARD_APK_URL =
-            "https://github.com/senzhk/ADBKeyBoard/releases/download/v2.4-dev/keyboardservice-debug.apk"
-        const val ADB_KEYBOARD_README_URL =
-            "https://github.com/senzhk/ADBKeyBoard/blob/master/README.md"
-        const val ADB_KEYBOARD_PACKAGE = "com.android.adbkeyboard"
-        const val ADB_KEYBOARD_IME_ID = "com.android.adbkeyboard/.AdbIME"
-        const val TV_APK_TEMP_PATH = "/data/local/tmp/keyboardservice-debug.apk"
 
         private const val A_VERSION = 0x01000001
         private const val MAX_PAYLOAD = 256 * 1024
         private const val MAX_INCOMING_PAYLOAD = 1024 * 1024
-        private const val SYNC_DATA_MAX = 65_536
 
         private const val A_CNXN = 0x4e584e43
         private const val A_OPEN = 0x4e45504f
@@ -838,6 +594,11 @@ class NetworkAdbClient(
 
         private val SAFE_PACKAGE_REGEX = Regex("^[A-Za-z0-9._-]+$")
         private val SAFE_URI_REGEX = Regex("^[A-Za-z0-9+._:/?=&%-]+$")
+        private val METHOD_ID_REGEX = Regex("(?:mCurMethodId|mCurId)=([^\\s]+)")
+        private val SUBTYPE_LOCALE_REGEX = Regex(
+            "(?:mSubtypeLocale|locale|languageTag|currentLocale|activeLocale)\\s*[=:]\\s*([A-Za-z0-9_-]+)",
+            RegexOption.IGNORE_CASE
+        )
 
         fun sanitizePackageName(raw: String): String? {
             val trimmed = raw.trim()
@@ -855,102 +616,147 @@ class NetworkAdbClient(
 
         fun escapeSingleQuotedShellArg(value: String): String = value.replace("'", "'\\''")
 
-        fun buildAdbKeyboardCheckShellCommand(): String = buildString {
-            append("if pm path $ADB_KEYBOARD_PACKAGE >/dev/null 2>&1; then ")
-            append("ime enable $ADB_KEYBOARD_IME_ID >/dev/null 2>&1; ")
-            append("echo \"ADBKB=INSTALLED\"; ")
-            append("elif ime list -a -s 2>/dev/null | grep -qi \"$ADB_KEYBOARD_PACKAGE\"; then ")
-            append("ime enable $ADB_KEYBOARD_IME_ID >/dev/null 2>&1; ")
-            append("echo \"ADBKB=INSTALLED\"; ")
-            append("else echo \"ADBKB=MISSING\"; fi")
+        fun buildReadTvImeStatusShellCommand(): String = buildString {
+            append("CUR_IME=\$(settings get secure default_input_method 2>/dev/null | tr -d '\\r\\n'); ")
+            append("CUR_SUB=\$(settings get secure selected_input_method_subtype 2>/dev/null | tr -d '\\r\\n'); ")
+            append("DMP=\$(dumpsys input_method 2>/dev/null); ")
+            append("CUR_LINE=\$(printf '%s\\n' \"\$DMP\" | grep -m6 -E 'mCurMethodId=|mCurId=|mCurrentSubtype=|mSystemLocale='); ")
+            append("SUB_MATCH=\"\"; ")
+            append("if [ -n \"\$CUR_SUB\" ] && [ \"\$CUR_SUB\" != \"null\" ] && [ \"\$CUR_SUB\" != \"-1\" ]; then ")
+            append("SUB_MATCH=\$(printf '%s\\n' \"\$DMP\" | grep -A3 -E \"(mSubtypeId|mSubtypeHashCode|hashCode|id)=\$CUR_SUB([^0-9]|\\$)\" | head -n 8); ")
+            append("fi; ")
+            append("IME_SVC_DUMP=\"\"; ")
+            append("if [ -n \"\$CUR_IME\" ] && [ \"\$CUR_IME\" != \"null\" ]; then ")
+            append("IME_SVC_DUMP=\$(dumpsys activity service \"\$CUR_IME\" 2>/dev/null | grep -iE 'locale|language|hangul|korean|qwerty|subtype|keyboard' | head -n 10); ")
+            append("fi; ")
+            append("SYS_LOC=\$(getprop persist.sys.locale 2>/dev/null | tr -d '\\r\\n'); ")
+            append("if [ -z \"\$SYS_LOC\" ]; then SYS_LOC=\$(settings get system system_locales 2>/dev/null | tr -d '\\r\\n'); fi; ")
+            append("echo \"CUR_IME=\$CUR_IME\"; ")
+            append("echo \"CUR_SUB=\$CUR_SUB\"; ")
+            append("echo \"SYS_LOC=\$SYS_LOC\"; ")
+            append("echo \"---CUR---\"; printf '%s\\n' \"\$CUR_LINE\"; ")
+            append("echo \"---SUB---\"; printf '%s\\n' \"\$SUB_MATCH\"; ")
+            append("echo \"---SVC---\"; printf '%s\\n' \"\$IME_SVC_DUMP\"")
         }
 
-        /**
-         * Builds the shell command to clear (via `ADB_CLEAR_TEXT`) and send text via `ADBKeyBoard`.
-         * ASCII text uses `ADB_INPUT_TEXT` while non-ASCII/UTF-8 text (e.g. Korean) uses `ADB_INPUT_B64`
-         * per ADBKeyBoard README section 1 & 1.1 because Android 8+ `am broadcast` strips UTF-8 extras.
-         */
-        fun buildAdbKeyboardSendCommand(
-            text: String,
-            clearExisting: Boolean = true,
-            submitWithEnter: Boolean = false
-        ): String? {
-            if (!clearExisting && text.isEmpty() && !submitWithEnter) return null
-            if (!clearExisting && text.isEmpty() && submitWithEnter) {
-                return "input keyevent 66 2>&1"
+        fun parseTvImeStatus(raw: String): TvImeStatus {
+            val lines = raw.lines()
+            fun headerVal(prefix: String): String {
+                val value = lines.firstOrNull { it.startsWith(prefix) }?.removePrefix(prefix)?.trim().orEmpty()
+                return if (value.equals("null", ignoreCase = true)) "" else value
             }
-            val needsImeBroadcast = clearExisting || text.isNotEmpty()
-            return buildString {
-                if (needsImeBroadcast) {
-                    append("PREV_IME=\$(settings get secure default_input_method 2>/dev/null | tr -d '\\r\\n'); ")
-                    append("SWITCHED=0; ")
-                    append("if [ \"\$PREV_IME\" != \"$ADB_KEYBOARD_IME_ID\" ]; then ")
-                    append("ime enable $ADB_KEYBOARD_IME_ID >/dev/null 2>&1; ")
-                    append("ime set $ADB_KEYBOARD_IME_ID >/dev/null 2>&1; ")
-                    append("SWITCHED=1; ")
-                    append("sleep 0.4; ")
-                    append("fi; ")
+
+            var imeId = headerVal("CUR_IME=")
+            val sysLoc = headerVal("SYS_LOC=")
+            val curSection = raw.substringAfter("---CUR---", "").substringBefore("---SUB---")
+            val subSection = raw.substringAfter("---SUB---", "").substringBefore("---SVC---")
+            val svcSection = raw.substringAfter("---SVC---", "")
+
+            if (imeId.isBlank()) {
+                imeId = METHOD_ID_REGEX.find(curSection)?.groupValues?.getOrNull(1).orEmpty()
+            }
+            val cleanImeId = imeId.ifBlank { null }
+            val imeType = TvImeKeycodeMap.resolveImeType(cleanImeId)
+
+            val currentSubtypeLines = curSection.lines()
+                .filter { it.contains("mCurrentSubtype=", ignoreCase = true) }
+                .joinToString("\n")
+            val systemLocaleLines = curSection.lines()
+                .filter { it.contains("mSystemLocale=", ignoreCase = true) }
+                .joinToString("\n")
+
+            val match = detectLanguageInBlock(currentSubtypeLines)
+                ?: detectLanguageInBlock(subSection)
+                ?: detectLanguageInBlock(svcSection)
+                ?: if (imeType == TvImeType.GOOGLE_KOREAN) {
+                    TvKeyboardLanguage.KOREAN to "ko_KR"
+                } else {
+                    null
                 }
-                if (clearExisting) {
-                    append("am broadcast -a ADB_CLEAR_TEXT 2>&1")
-                    if (text.isNotEmpty()) {
-                        append("; sleep 0.08; ")
-                    }
-                }
-                if (text.isNotEmpty()) {
-                    if (isAsciiInputSupported(text)) {
-                        val escaped = escapeSingleQuotedShellArg(text)
-                        append("am broadcast -a ADB_INPUT_TEXT --es msg '$escaped' 2>&1")
-                    } else {
-                        val b64 = AdbKeyManager.encodeBase64(text.toByteArray(Charsets.UTF_8))
-                        append("am broadcast -a ADB_INPUT_B64 --es msg '$b64' 2>&1")
-                    }
-                }
-                if (submitWithEnter) {
-                    if (clearExisting || text.isNotEmpty()) {
-                        append("; sleep 0.1; ")
-                    }
-                    append("input keyevent 66 2>&1")
-                }
-                if (needsImeBroadcast) {
-                    append("; ")
-                    append("if [ \"\$SWITCHED\" = \"1\" ] && [ -n \"\$PREV_IME\" ] && [ \"\$PREV_IME\" != \"null\" ]; then ")
-                    append("sleep 0.15; ")
-                    append("ime set \"\$PREV_IME\" >/dev/null 2>&1; ")
-                    append("fi")
-                }
+
+            if (match != null) {
+                return TvImeStatus(
+                    language = match.first,
+                    imeId = cleanImeId,
+                    imeType = imeType,
+                    subtypeLocale = match.second,
+                    isDetected = true
+                )
+            }
+
+            val sysLocaleMatch = detectLocaleFromText(sysLoc) ?: detectLanguageInBlock(systemLocaleLines)
+            if (sysLocaleMatch != null) {
+                return TvImeStatus(
+                    language = sysLocaleMatch.first,
+                    imeId = cleanImeId,
+                    imeType = imeType,
+                    subtypeLocale = sysLocaleMatch.second,
+                    isDetected = cleanImeId != null
+                )
+            }
+
+            return TvImeStatus(
+                language = TvKeyboardLanguage.ENGLISH,
+                imeId = cleanImeId,
+                imeType = imeType,
+                subtypeLocale = null,
+                isDetected = false
+            )
+        }
+
+        private fun detectLanguageInBlock(block: String): Pair<TvKeyboardLanguage, String?>? {
+            if (block.isBlank()) return null
+            val localeToken = SUBTYPE_LOCALE_REGEX.find(block)?.groupValues?.getOrNull(1)
+            if (!localeToken.isNullOrBlank()) {
+                detectLocaleFromText(localeToken)?.let { return it }
+            }
+            val lower = block.lowercase()
+            return when {
+                lower.contains("hangul=true") ||
+                    lower.contains("korean=true") ||
+                    lower.contains("keyboardlayoutset=korean") ||
+                    lower.contains("ko_kr") ||
+                    lower.contains("ko-kr") ||
+                    Regex("\\bko\\b").containsMatchIn(lower) ->
+                    TvKeyboardLanguage.KOREAN to (localeToken ?: "ko_KR")
+                lower.contains("hangul=false") ||
+                    lower.contains("en_us") ||
+                    lower.contains("en-us") ||
+                    lower.contains("en_gb") ||
+                    lower.contains("en-gb") ||
+                    lower.contains("keyboardlayoutset=qwerty") ->
+                    TvKeyboardLanguage.ENGLISH to (localeToken ?: "en_US")
+                else -> null
             }
         }
 
-        fun buildSyncSpecPacket(remotePath: String, mode: Int = 33188): ByteArray {
-            val specBytes = "$remotePath,$mode".toByteArray(Charsets.UTF_8)
-            return ByteBuffer.allocate(8 + specBytes.size).order(ByteOrder.LITTLE_ENDIAN).apply {
-                put("SEND".toByteArray(Charsets.US_ASCII))
-                putInt(specBytes.size)
-                put(specBytes)
-            }.array()
+        private fun detectLocaleFromText(rawLocale: String): Pair<TvKeyboardLanguage, String>? {
+            val cleaned = rawLocale.trim().substringBefore(',').trim()
+            if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true)) return null
+            val lower = cleaned.lowercase()
+            return when {
+                lower == "ko" || lower.startsWith("ko_") || lower.startsWith("ko-") ->
+                    TvKeyboardLanguage.KOREAN to cleaned
+                lower == "en" || lower.startsWith("en_") || lower.startsWith("en-") ->
+                    TvKeyboardLanguage.ENGLISH to cleaned
+                else -> null
+            }
         }
 
-        fun buildSyncChunkPacket(data: ByteArray, offset: Int, length: Int): ByteArray {
-            return ByteBuffer.allocate(8 + length).order(ByteOrder.LITTLE_ENDIAN).apply {
-                put("DATA".toByteArray(Charsets.US_ASCII))
-                putInt(length)
-                put(data, offset, length)
-            }.array()
+        fun buildKeyCombinationShellCommand(vararg keyCodes: Int): String? {
+            if (keyCodes.size < 2 || keyCodes.any { it <= 0 }) return null
+            val codes = keyCodes.joinToString(" ")
+            return "input keycombination $codes 2>&1"
         }
 
-        fun buildSyncDonePacket(mtimeSeconds: Int): ByteArray {
-            return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).apply {
-                put("DONE".toByteArray(Charsets.US_ASCII))
-                putInt(mtimeSeconds)
-            }.array()
-        }
-
-        fun buildSyncQuitPacket(): ByteArray {
-            return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).apply {
-                put("QUIT".toByteArray(Charsets.US_ASCII))
-                putInt(0)
-            }.array()
+        fun buildSelectAllAndDeleteShellCommand(): String = buildString {
+            append("OUT=\$(input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A} 2>&1); ")
+            append("if echo \"\$OUT\" | grep -qiE \"Error:|Unknown|Exception\"; then ")
+            append("${buildClearKeyEventsPrefix(20)} 2>&1; ")
+            append("else ")
+            append("sleep 0.08; ")
+            append("input keyevent ${TvKeyCodes.DEL} 2>&1; ")
+            append("fi")
         }
 
         fun buildClearKeyEventsPrefix(clearCount: Int): String {

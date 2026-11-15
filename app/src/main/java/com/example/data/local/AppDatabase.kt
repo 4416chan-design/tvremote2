@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         CustomButtonEntity::class,
         AppPreferencesEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -37,6 +37,25 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `app_preferences_new` (" +
+                        "`id` INTEGER NOT NULL, " +
+                        "`hapticEnabled` INTEGER NOT NULL, " +
+                        "`autoShowKeyboard` INTEGER NOT NULL, " +
+                        "`brightnessPercent` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`id`))"
+                )
+                db.execSQL(
+                    "INSERT INTO `app_preferences_new` (`id`, `hapticEnabled`, `autoShowKeyboard`, `brightnessPercent`) " +
+                        "SELECT `id`, `hapticEnabled`, `autoShowKeyboard`, `brightnessPercent` FROM `app_preferences`"
+                )
+                db.execSQL("DROP TABLE `app_preferences`")
+                db.execSQL("ALTER TABLE `app_preferences_new` RENAME TO `app_preferences`")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -44,7 +63,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "tv_remote_db"
                 )
-                    .addMigrations(MIGRATION_2_3)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
                     .fallbackToDestructiveMigration(true)
                     .build()
                     .also { INSTANCE = it }

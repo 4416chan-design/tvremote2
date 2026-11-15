@@ -1,7 +1,12 @@
 package com.example
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -13,7 +18,10 @@ import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
-import com.example.ui.components.AdbKeyboardSetupDialog
+import com.example.data.model.TvImeStatus
+import com.example.data.model.TvImeType
+import com.example.data.model.TvKeyboardLanguage
+import com.example.data.model.TvKeyCodes
 import com.example.ui.components.KeyboardInputSheet
 import com.example.ui.components.computeRealTimeBackspaceCount
 import com.example.ui.theme.TvRemoteTheme
@@ -33,19 +41,29 @@ class KeyboardInputSheetRobolectricTest {
 
     @OptIn(ExperimentalTestApi::class)
     @Test
-    fun `live mode is removed, only Backspace sends in real time, and Send always replaces and submits`() {
+    fun `text field clear triggers SelectAllDelete without backspace and Send always replaces and submits`() {
         val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
         val sentKeys = mutableListOf<Int>()
         val backspaceCalls = mutableListOf<Int>()
+        var clearAllCalls = 0
+        var resyncCalls = 0
 
         composeRule.setContent {
             TvRemoteTheme {
                 KeyboardInputSheet(
                     tvName = "Living Room TV",
                     initialText = "",
-                    isTvImeVisible = false,
+                    isTvImeVisible = true,
                     isAdbConnected = true,
-                    isAdbKeyboardInstalled = true,
+                    keyboardLanguage = TvKeyboardLanguage.KOREAN,
+                    tvImeStatus = TvImeStatus(
+                        language = TvKeyboardLanguage.KOREAN,
+                        imeType = TvImeType.GBOARD,
+                        subtypeLocale = "ko_KR",
+                        isDetected = true
+                    ),
+                    onResyncTvIme = { resyncCalls++ },
+                    onClearAll = { clearAllCalls++ },
                     onSendText = { text, replaceExisting, submitWithEnter ->
                         sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
                     },
@@ -56,12 +74,16 @@ class KeyboardInputSheetRobolectricTest {
             }
         }
 
-        // Live mode toggle pill must be removed
-        composeRule.onNodeWithTag("keyboard_mode_live").assertDoesNotExist()
-        composeRule.onNodeWithText("ADBKeyBoard 연결됨 · 백스페이스 실시간 · 전체 교체 전송").assertExists()
+        // ADBKeyBoard banner must be completely removed; TV IME status is displayed instead
+        composeRule.onNodeWithTag("adb_keyboard_setup_banner").assertDoesNotExist()
+        composeRule.onNodeWithText("TV IME: 한글 (Gboard) · 물리키 실시간/텍스트 전송").assertExists()
+
+        // Resync TV IME button triggers callback
+        composeRule.onNodeWithTag("keyboard_resync_ime_button").performScrollTo().performClick()
+        assertEquals(1, resyncCalls)
 
         // Pressing Backspace when empty sends physical Backspace immediately
-        composeRule.onNodeWithTag("tv_keyboard_input_field").performClick()
+        composeRule.onNodeWithTag("tv_keyboard_input_field").performScrollTo().performClick()
         composeRule.onNodeWithTag("tv_keyboard_input_field").performKeyInput {
             pressKey(Key.Backspace)
         }
@@ -69,7 +91,7 @@ class KeyboardInputSheetRobolectricTest {
         assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
 
         // Pressing Send even when empty clears -> inputs nothing -> sends ENTER (replaceExisting=true, submitWithEnter=true)
-        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
+        composeRule.onNodeWithTag("keyboard_send_search_button").performScrollTo().performClick()
         assertEquals(listOf(Triple("", true, true)), sentTexts)
         assertEquals(emptyList<Int>(), sentKeys)
 
@@ -86,28 +108,22 @@ class KeyboardInputSheetRobolectricTest {
         }
         assertEquals(listOf(1), backspaceCalls)
 
-        // Modifying text and pressing Send always invokes full clear -> input -> Enter
+        // Modifying text and pressing Send always invokes full replacement + Enter
         composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("유튜브 검색")
-        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
+        composeRule.onNodeWithTag("keyboard_send_search_button").performScrollTo().performClick()
         assertEquals(listOf(Triple("유튜브 검색", true, true)), sentTexts)
 
-        // Even unchanged ASCII text always goes through full clear -> input -> Enter (no Enter-only shortcut)
+        // Clicking "전체 지우기" invokes onClearAll (Ctrl+A -> DEL) AND empties the local input box
         sentTexts.clear()
-        composeRule.onNodeWithTag("tv_keyboard_input_field").performTextReplacement("bts")
-        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
-        composeRule.onNodeWithTag("keyboard_send_search_button").performClick()
-        assertEquals(
-            listOf(
-                Triple("bts", true, true),
-                Triple("bts", true, true)
-            ),
-            sentTexts
-        )
+        backspaceCalls.clear()
+        composeRule.onNodeWithTag("keyboard_clear_button").performScrollTo().performClick()
+        assertEquals(1, clearAllCalls)
+        assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
+        assertEquals(emptyList<Int>(), backspaceCalls)
 
-        // Clicking "전체 지우기" always sends full clear without Enter
-        sentTexts.clear()
-        composeRule.onNodeWithTag("keyboard_clear_button").performClick()
-        assertEquals(listOf(Triple("", true, false)), sentTexts)
+        // Subsequent Send transmits empty text (confirming local field was cleared too)
+        composeRule.onNodeWithTag("keyboard_send_search_button").performScrollTo().performClick()
+        assertEquals(listOf(Triple("", true, true)), sentTexts)
     }
 
     @Test
@@ -183,72 +199,78 @@ class KeyboardInputSheetRobolectricTest {
     }
 
     @Test
-    fun `missing ADBKeyBoard shows setup banner and clear sends ADB_CLEAR_TEXT`() {
-        var openSetupCalls = 0
-        val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
+    fun `physical keypad switches between English QWERTY and Korean 2-bulsik with Shift and sends real-time keys`() {
+        val physicalPresses = mutableListOf<Pair<String, Boolean>>()
+        val sentKeys = mutableListOf<Int>()
         val backspaceCalls = mutableListOf<Int>()
+        val sentTexts = mutableListOf<Triple<String, Boolean, Boolean>>()
+        var toggleCalls = 0
 
         composeRule.setContent {
+            var language by remember { mutableStateOf(TvKeyboardLanguage.ENGLISH) }
             TvRemoteTheme {
                 KeyboardInputSheet(
-                    tvName = "Xiaomi TV",
-                    initialText = "abc",
+                    tvName = "Living Room TV",
+                    initialText = "",
                     isTvImeVisible = true,
                     isAdbConnected = true,
-                    isAdbKeyboardInstalled = false,
-                    onOpenAdbKeyboardSetup = { openSetupCalls++ },
+                    keyboardLanguage = language,
+                    tvImeStatus = TvImeStatus(language = language, imeType = TvImeType.GBOARD, isDetected = true),
+                    onToggleLanguage = {
+                        toggleCalls++
+                        language = if (language == TvKeyboardLanguage.ENGLISH) {
+                            TvKeyboardLanguage.KOREAN
+                        } else {
+                            TvKeyboardLanguage.ENGLISH
+                        }
+                    },
+                    onPhysicalKeyPress = { spec, shift ->
+                        physicalPresses.add(spec.id to shift)
+                    },
                     onSendText = { text, replaceExisting, submitWithEnter ->
                         sentTexts.add(Triple(text, replaceExisting, submitWithEnter))
                     },
-                    onSendKey = {},
+                    onSendKey = { key -> sentKeys.add(key) },
                     onBackspace = { count -> backspaceCalls.add(count) },
                     onDismiss = {}
                 )
             }
         }
 
-        composeRule.onNodeWithTag("adb_keyboard_setup_banner").performClick()
-        assertEquals(1, openSetupCalls)
+        // English mode: Q key displays 'q', then with Shift displays 'Q' and auto-unshifts after tap
+        composeRule.onNodeWithTag("phys_key_q").assertTextEquals("q")
+        composeRule.onNodeWithTag("phys_key_q").performScrollTo().performClick()
+        assertEquals(listOf("q" to false), physicalPresses)
 
-        composeRule.onNodeWithTag("keyboard_clear_button").performClick()
-        assertEquals(listOf(Triple("", true, false)), sentTexts)
-        assertEquals(emptyList<Int>(), backspaceCalls)
-    }
+        composeRule.onNodeWithTag("phys_key_shift").performScrollTo().performClick()
+        composeRule.onNodeWithTag("phys_key_q").assertTextEquals("Q")
+        composeRule.onNodeWithTag("phys_key_q").performScrollTo().performClick()
+        composeRule.onNodeWithTag("phys_key_q").assertTextEquals("q")
+        assertEquals(listOf("q" to false, "q" to true), physicalPresses)
 
-    @Test
-    fun `adb keyboard setup dialog guides Download folder APK install and invokes actions`() {
-        var pickClicks = 0
-        var openTvDlClicks = 0
-        var redownloadClicks = 0
-        var verifyClicks = 0
-        var dismissClicks = 0
+        // Toggle to Korean via '한/영' key -> Q key changes to 'ㅂ', shifted to 'ㅃ', A key stays 'ㅁ'
+        composeRule.onNodeWithTag("phys_key_lang_switch").performScrollTo().performClick()
+        assertEquals(1, toggleCalls)
+        composeRule.onNodeWithTag("phys_key_q").assertTextEquals("ㅂ")
+        composeRule.onNodeWithTag("phys_key_q").performScrollTo().performClick()
 
-        composeRule.setContent {
-            TvRemoteTheme {
-                AdbKeyboardSetupDialog(
-                    isInstalled = false,
-                    statusMessage = "인터넷 창에서 다운로드를 시작했습니다.",
-                    isInstalling = false,
-                    onPickApkFromDownloads = { pickClicks++ },
-                    onOpenTvDownloads = { openTvDlClicks++ },
-                    onRedownloadInBrowser = { redownloadClicks++ },
-                    onVerifyInstalled = { verifyClicks++ },
-                    onDismiss = { dismissClicks++ }
-                )
-            }
-        }
+        composeRule.onNodeWithTag("phys_key_shift").performScrollTo().performClick()
+        composeRule.onNodeWithTag("phys_key_q").assertTextEquals("ㅃ")
+        composeRule.onNodeWithTag("phys_key_a").assertTextEquals("ㅁ")
+        composeRule.onNodeWithTag("phys_key_q").performScrollTo().performClick()
 
-        composeRule.onNodeWithText("Download/keyboardservice-debug.apk").assertExists()
-        composeRule.onNodeWithTag("adb_kb_pick_apk_button").performScrollTo().performClick()
-        composeRule.onNodeWithTag("adb_kb_open_tv_downloads_button").performScrollTo().performClick()
-        composeRule.onNodeWithTag("adb_kb_redownload_button").performScrollTo().performClick()
-        composeRule.onNodeWithTag("adb_kb_verify_button").performScrollTo().performClick()
-        composeRule.onNodeWithTag("adb_kb_dismiss_button").performClick()
+        assertEquals(
+            listOf("q" to false, "q" to true, "q" to false, "q" to true),
+            physicalPresses
+        )
 
-        assertEquals(1, pickClicks)
-        assertEquals(1, openTvDlClicks)
-        assertEquals(1, redownloadClicks)
-        assertEquals(1, verifyClicks)
-        assertEquals(1, dismissClicks)
+        // Backspace, Space, Enter on physical keypad
+        composeRule.onNodeWithTag("phys_key_backspace").performScrollTo().performClick()
+        composeRule.onNodeWithTag("phys_key_space").performScrollTo().performClick()
+        composeRule.onNodeWithTag("phys_key_enter").performScrollTo().performClick()
+
+        assertEquals(listOf(1), backspaceCalls)
+        assertEquals(listOf(TvKeyCodes.SPACE, TvKeyCodes.ENTER), sentKeys)
+        assertEquals(emptyList<Triple<String, Boolean, Boolean>>(), sentTexts)
     }
 }

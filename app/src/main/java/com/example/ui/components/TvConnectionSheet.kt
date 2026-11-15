@@ -86,10 +86,8 @@ fun TvConnectionSheet(
     connectionState: TvConnectionState,
     adbState: AdbConnectionState = AdbConnectionState.DISCONNECTED,
     adbStatusDetail: String? = null,
-    adbKeyboardInstalled: Boolean? = null,
     onRefreshScan: () -> Unit,
     onRetryAdb: () -> Unit = {},
-    onOpenAdbKeyboardSetup: () -> Unit = {},
     onConnectTv: (host: String, name: String, remotePort: Int, pairingPort: Int) -> Unit,
     onDisconnect: () -> Unit,
     onDismiss: () -> Unit
@@ -235,52 +233,24 @@ fun TvConnectionSheet(
                                 .fillMaxWidth()
                                 .border(1.dp, CharcoalBorder, RoundedCornerShape(16.dp))
                         ) {
-                            Column(
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 14.dp, vertical = 10.dp)
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        text = adbLabel,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = adbColor,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    if (adbState != AdbConnectionState.CONNECTED && adbState != AdbConnectionState.CONNECTING) {
-                                        TextButton(
-                                            onClick = onRetryAdb,
-                                            modifier = Modifier.testTag("retry_adb_button")
-                                        ) {
-                                            Text("ADB 연결", color = MintGreen)
-                                        }
-                                    }
-                                }
-
-                                val (kbLabel, kbColor, kbActionLabel) = when (adbKeyboardInstalled) {
-                                    true -> Triple("ADBKeyBoard 설치됨 · 한글 전송 준비 완료", MintGreen, null)
-                                    false -> Triple("ADBKeyBoard 미설치 · Download APK 설치 필요", WarningAmber, "설치")
-                                    null -> Triple("ADBKeyBoard 상태 확인 및 APK 설치", TextSecondary, "설치 안내")
-                                }
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        text = kbLabel,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = kbColor,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    if (kbActionLabel != null) {
-                                        TextButton(
-                                            onClick = onOpenAdbKeyboardSetup,
-                                            modifier = Modifier.testTag("adb_keyboard_install_button")
-                                        ) {
-                                            Text(kbActionLabel, color = MintGreen)
-                                        }
+                                Text(
+                                    text = adbLabel,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = adbColor,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (adbState != AdbConnectionState.CONNECTED && adbState != AdbConnectionState.CONNECTING) {
+                                    TextButton(
+                                        onClick = onRetryAdb,
+                                        modifier = Modifier.testTag("retry_adb_button")
+                                    ) {
+                                        Text("ADB 연결", color = MintGreen)
                                     }
                                 }
                             }

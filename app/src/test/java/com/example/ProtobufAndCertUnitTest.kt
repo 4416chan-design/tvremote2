@@ -749,51 +749,84 @@ class ProtobufAndCertUnitTest {
     }
 
     @Test
-    fun `adb keyboard command builder formats ADB_CLEAR_TEXT ADB_INPUT_TEXT and Korean ADB_INPUT_B64`() {
+    fun `tv keycodes and per-IME keymap map Q and hangul to physical keycodes`() {
+        assertEquals(29, TvKeyCodes.KEYCODE_A)
+        assertEquals(45, TvKeyCodes.KEYCODE_Q)
+        assertEquals(54, TvKeyCodes.KEYCODE_Z)
+        assertEquals(7, TvKeyCodes.KEYCODE_0)
+        assertEquals(16, TvKeyCodes.KEYCODE_9)
+        assertEquals(113, TvKeyCodes.CTRL_LEFT)
+        assertEquals(59, TvKeyCodes.SHIFT_LEFT)
+        assertEquals(204, TvKeyCodes.LANGUAGE_SWITCH)
+        assertEquals(55, TvKeyCodes.COMMA)
+        assertEquals(56, TvKeyCodes.PERIOD)
+
         assertEquals(
-            "https://github.com/senzhk/ADBKeyBoard/releases/download/v2.4-dev/keyboardservice-debug.apk",
-            com.example.network.NetworkAdbClient.ADB_KEYBOARD_APK_URL
+            com.example.data.model.TvImeType.GBOARD,
+            com.example.data.model.TvImeKeycodeMap.resolveImeType("com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME")
         )
-        assertEquals(null, com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand("", clearExisting = false, submitWithEnter = false))
-        assertEquals("input keyevent 66 2>&1", com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand("", clearExisting = false, submitWithEnter = true))
+        assertEquals(
+            com.example.data.model.TvImeType.GOOGLE_KOREAN,
+            com.example.data.model.TvImeKeycodeMap.resolveImeType("com.google.android.inputmethod.korean/.KoreanIME")
+        )
+        assertEquals(
+            com.example.data.model.TvImeType.SAMSUNG,
+            com.example.data.model.TvImeKeycodeMap.resolveImeType("com.samsung.android.honeyboard/.service.HoneyBoardService")
+        )
+        assertEquals(
+            com.example.data.model.PhysicalKeyAction(TvKeyCodes.LANGUAGE_SWITCH),
+            com.example.data.model.TvImeKeycodeMap.resolveLanguageSwitchAction(com.example.data.model.TvImeType.GBOARD)
+        )
+        assertEquals(
+            com.example.data.model.PhysicalKeyAction(TvKeyCodes.SPACE, shift = true),
+            com.example.data.model.TvImeKeycodeMap.resolveLanguageSwitchAction(com.example.data.model.TvImeType.GOOGLE_KOREAN)
+        )
 
-        val asciiCmd = com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand(
-            text = "it's bts",
-            clearExisting = true,
-            submitWithEnter = true
-        )!!
-        assertTrue(asciiCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-        assertTrue(asciiCmd.contains("am broadcast -a ADB_INPUT_TEXT --es msg 'it'\\''s bts' 2>&1"))
-        assertTrue(asciiCmd.contains("input keyevent 66 2>&1"))
-        assertTrue(asciiCmd.contains("ime set \"\$PREV_IME\""))
+        val qSpec = com.example.data.model.TvImeKeycodeMap.findSpecById("q")!!
+        assertEquals("q", qSpec.labelFor(com.example.data.model.TvKeyboardLanguage.ENGLISH, shifted = false))
+        assertEquals("Q", qSpec.labelFor(com.example.data.model.TvKeyboardLanguage.ENGLISH, shifted = true))
+        assertEquals("ㅂ", qSpec.labelFor(com.example.data.model.TvKeyboardLanguage.KOREAN, shifted = false))
+        assertEquals("ㅃ", qSpec.labelFor(com.example.data.model.TvKeyboardLanguage.KOREAN, shifted = true))
 
-        val koCmd = com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand(
-            text = "유튜브 검색",
-            clearExisting = true,
-            submitWithEnter = true
-        )!!
-        val expectedB64 = com.example.network.AdbKeyManager.encodeBase64("유튜브 검색".toByteArray(Charsets.UTF_8))
-        assertTrue(koCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-        assertTrue(koCmd.contains("am broadcast -a ADB_INPUT_B64 --es msg '$expectedB64' 2>&1"))
-        assertTrue(koCmd.contains("input keyevent 66 2>&1"))
+        assertEquals(
+            com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_Q, shift = false),
+            com.example.data.model.TvImeKeycodeMap.resolveKeyAction(
+                com.example.data.model.TvImeType.GBOARD,
+                com.example.data.model.TvKeyboardLanguage.KOREAN,
+                qSpec,
+                shifted = false
+            )
+        )
+        assertEquals(
+            com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_Q, shift = true),
+            com.example.data.model.TvImeKeycodeMap.resolveKeyAction(
+                com.example.data.model.TvImeType.GBOARD,
+                com.example.data.model.TvKeyboardLanguage.KOREAN,
+                qSpec,
+                shifted = true
+            )
+        )
 
-        val clearOnly = com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand(
-            text = "",
-            clearExisting = true,
-            submitWithEnter = false
-        )!!
-        assertTrue(clearOnly.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-        assertEquals(false, clearOnly.contains("ADB_INPUT_TEXT"))
-        assertEquals(false, clearOnly.contains("input keyevent 66"))
-
-        val clearAndEnter = com.example.network.NetworkAdbClient.buildAdbKeyboardSendCommand(
-            text = "",
-            clearExisting = true,
-            submitWithEnter = true
-        )!!
-        assertTrue(clearAndEnter.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1; sleep 0.1; input keyevent 66 2>&1"))
-        assertEquals(false, clearAndEnter.contains("ADB_INPUT_TEXT"))
-        assertEquals(false, clearAndEnter.contains("ADB_INPUT_B64"))
+        // Single Korean jamo without doubled shift form (e.g., ㅁ) must NOT send spurious Shift
+        val aSpec = com.example.data.model.TvImeKeycodeMap.findSpecById("a")!!
+        assertEquals(
+            com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_A, shift = false),
+            com.example.data.model.TvImeKeycodeMap.resolveKeyAction(
+                com.example.data.model.TvImeType.GBOARD,
+                com.example.data.model.TvKeyboardLanguage.KOREAN,
+                aSpec,
+                shifted = true
+            )
+        )
+        assertEquals(
+            com.example.data.model.PhysicalKeyAction(TvKeyCodes.KEYCODE_A, shift = true),
+            com.example.data.model.TvImeKeycodeMap.resolveKeyAction(
+                com.example.data.model.TvImeType.GBOARD,
+                com.example.data.model.TvKeyboardLanguage.ENGLISH,
+                aSpec,
+                shifted = true
+            )
+        )
     }
 
     @Test
@@ -827,161 +860,115 @@ class ProtobufAndCertUnitTest {
     }
 
     @Test
-    fun `adb sync file transfer and pm install succeed over loopback tcp mux`() {
-        val tempDir = java.io.File.createTempFile("adb_sync_test", "").apply {
-            delete()
-            mkdirs()
-        }
-        val server = java.net.ServerSocket(0)
-        val receivedSyncBytes = java.io.ByteArrayOutputStream()
-        var capturedInstallShell = ""
-        val serverReady = java.util.concurrent.CountDownLatch(1)
-
-        val serverThread = Thread {
-            serverReady.countDown()
-            val sock = server.accept()
-            sock.soTimeout = 5_000
-            val inp = sock.getInputStream()
-            val out = sock.getOutputStream()
-
-            fun readFully(n: Int): ByteArray {
-                val buf = ByteArray(n)
-                var off = 0
-                while (off < n) {
-                    val r = inp.read(buf, off, n - off)
-                    if (r < 0) throw java.io.EOFException()
-                    off += r
-                }
-                return buf
-            }
-
-            fun writePkt(cmd: Int, a0: Int, a1: Int, data: ByteArray = ByteArray(0)) {
-                val sum = data.fold(0) { acc, b -> acc + (b.toInt() and 0xFF) }
-                val hdr = java.nio.ByteBuffer.allocate(24).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
-                    putInt(cmd); putInt(a0); putInt(a1); putInt(data.size); putInt(sum); putInt(cmd.inv())
-                }.array()
-                out.write(hdr)
-                if (data.isNotEmpty()) out.write(data)
-                out.flush()
-            }
-
-            val aCnxn = 0x4e584e43
-            val aOpen = 0x4e45504f
-            val aOkay = 0x59414b4f
-            val aClse = 0x45534c43
-            val aWrte = 0x45545257
-            var activeService = ""
-            var peerStreamId = 0
-            val syncAccumulator = java.io.ByteArrayOutputStream()
-            var syncOffset = 0
-            var parsedSpec = false
-            var doneReceived = false
-
-            fun tryParseSyncBuffer() {
-                val bytes = syncAccumulator.toByteArray()
-                while (true) {
-                    if (bytes.size - syncOffset < 8) return
-                    val tag = String(bytes, syncOffset, 4, Charsets.US_ASCII)
-                    val lenOrMtime = java.nio.ByteBuffer.wrap(bytes, syncOffset + 4, 4)
-                        .order(java.nio.ByteOrder.LITTLE_ENDIAN).int
-                    when (tag) {
-                        "SEND" -> {
-                            if (bytes.size - syncOffset < 8 + lenOrMtime) return
-                            parsedSpec = true
-                            syncOffset += 8 + lenOrMtime
-                        }
-                        "DATA" -> {
-                            if (bytes.size - syncOffset < 8 + lenOrMtime) return
-                            receivedSyncBytes.write(bytes, syncOffset + 8, lenOrMtime)
-                            syncOffset += 8 + lenOrMtime
-                        }
-                        "DONE" -> {
-                            doneReceived = true
-                            syncOffset += 8
-                            val okReply = "OKAY\u0000\u0000\u0000\u0000".toByteArray(Charsets.US_ASCII)
-                            writePkt(aWrte, 99, peerStreamId, okReply)
-                        }
-                        "QUIT" -> {
-                            syncOffset += 8
-                            writePkt(aClse, 99, peerStreamId)
-                        }
-                        else -> return
-                    }
-                }
-            }
-
-            try {
-                while (!sock.isClosed) {
-                    val hdr = try {
-                        readFully(24)
-                    } catch (_: Throwable) {
-                        break
-                    }
-                    val bb = java.nio.ByteBuffer.wrap(hdr).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                    val cmd = bb.getInt()
-                    val a0 = bb.getInt()
-                    val a1 = bb.getInt()
-                    val len = bb.getInt()
-                    val payload = if (len > 0) readFully(len) else ByteArray(0)
-
-                    when (cmd) {
-                        aCnxn -> writePkt(aCnxn, 0x01000001, 64 * 1024, "device::\u0000".toByteArray())
-                        aOpen -> {
-                            val svc = String(payload, 0, (payload.size - 1).coerceAtLeast(0), Charsets.UTF_8)
-                            activeService = svc
-                            peerStreamId = a0
-                            writePkt(aOkay, 99, peerStreamId)
-                            if (svc.startsWith("shell:")) {
-                                capturedInstallShell = svc.removePrefix("shell:")
-                                writePkt(aWrte, 99, peerStreamId, "INSTALL=OK|Success\n".toByteArray())
-                                writePkt(aClse, 99, peerStreamId)
-                            }
-                        }
-                        aWrte -> {
-                            writePkt(aOkay, 99, a0)
-                            if (activeService == "sync:") {
-                                syncAccumulator.write(payload)
-                                tryParseSyncBuffer()
-                            }
-                        }
-                    }
-                }
-            } finally {
-                runCatching { sock.close() }
-            }
-        }.apply {
-            isDaemon = true
-            start()
+    fun `sendPhysicalKey with shift and selectAllAndDelete emit exact modifier key sequences`() {
+        val sentChunks = mutableListOf<ByteArray>()
+        val client = AndroidTvRemoteClient(
+            certStore = null,
+            onForegroundAppChanged = {},
+            onImeShowRequested = { _, _ -> },
+            onVolumeChanged = { _, _, _ -> },
+            onDisconnected = {}
+        ).apply {
+            testRawBytesSink = { bytes -> sentChunks.add(bytes) }
         }
 
-        try {
-            serverReady.await()
-            val client = com.example.network.NetworkAdbClient(com.example.network.AdbKeyManager(tempDir))
-            val fakeApk = byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4) +
-                ByteArray(70_000) { (it % 251).toByte() } // >64KB to also exercise chunking!
-
-            kotlinx.coroutines.runBlocking {
-                val badRes = client.installApkBytesOnTv(byteArrayOf(1, 2, 3, 4))
-                assertTrue(badRes.isFailure)
-
-                val connected = client.connect("127.0.0.1", server.localPort)
-                assertTrue(
-                    "Expected connect success, state=${client.adbState.value}, status=${client.adbStatusDetail.value}",
-                    connected
-                )
-                val installRes = client.installApkBytesOnTv(fakeApk)
-                assertTrue("Expected install success, got ${installRes.exceptionOrNull()}", installRes.isSuccess)
-                assertTrue(client.hasAdbKeyboardIme()) // cached true immediately after install
-                client.disconnect()
-            }
-
-            assertTrue(fakeApk.contentEquals(receivedSyncBytes.toByteArray()))
-            assertTrue(capturedInstallShell.contains("pm install -r -d /data/local/tmp/keyboardservice-debug.apk"))
-            assertTrue(capturedInstallShell.contains("ime enable com.android.adbkeyboard/.AdbIME"))
-        } finally {
-            server.close()
-            serverThread.join(1_000)
-            tempDir.deleteRecursively()
+        kotlinx.coroutines.runBlocking {
+            client.sendPhysicalKey(TvKeyCodes.KEYCODE_Q, shift = true)
         }
+
+        assertEquals(3, sentChunks.size)
+        fun keyAndDir(index: Int): Pair<Long, Long> {
+            val msg = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(sentChunks[index]))
+            ).first { it.number == 10 }.asMessage()
+            return msg.first { it.number == 1 }.varint to msg.first { it.number == 2 }.varint
+        }
+
+        assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDir(0))
+        assertEquals(TvKeyCodes.KEYCODE_Q.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(1))
+        assertEquals(TvKeyCodes.SHIFT_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(2))
+
+        sentChunks.clear()
+        kotlinx.coroutines.runBlocking {
+            client.sendKeyboardChars("hi")
+            sentChunks.clear()
+            client.selectAllAndDelete()
+        }
+
+        assertEquals(4, sentChunks.size)
+        assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDir(0))
+        assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(1))
+        assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDir(2))
+        assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDir(3))
+        assertEquals("", client.debugTrackedText)
+    }
+
+    @Test
+    fun `adb TV IME status parser and keycombination select-all-delete command builders behave accurately`() {
+        val probeCmd = com.example.network.NetworkAdbClient.buildReadTvImeStatusShellCommand()
+        assertTrue(probeCmd.contains("=$" + "CUR_SUB"))
+        assertEquals(false, probeCmd.contains("\\$" + "CUR_SUB"))
+        assertTrue(probeCmd.contains("mCurrentSubtype="))
+
+        // Active subtype en_US overrides Korean system locale
+        val enGboardDump = """
+            CUR_IME=com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+            CUR_SUB=112233
+            SYS_LOC=ko-KR
+            ---CUR---
+            mCurMethodId=com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+            mSystemLocale=ko_KR
+            mCurrentSubtype=android.view.inputmethod.InputMethodSubtype@abc mSubtypeLocale=en_US
+            ---SUB---
+            ---SVC---
+        """.trimIndent()
+        val enStatus = com.example.network.NetworkAdbClient.parseTvImeStatus(enGboardDump)
+        assertEquals(com.example.data.model.TvKeyboardLanguage.ENGLISH, enStatus.language)
+        assertEquals(com.example.data.model.TvImeType.GBOARD, enStatus.imeType)
+        assertEquals("en_US", enStatus.subtypeLocale)
+        assertTrue(enStatus.isDetected)
+
+        // Subtype lookup via ---SUB--- when mCurrentSubtype is omitted
+        val koSubLookupDump = """
+            CUR_IME=com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+            CUR_SUB=-987654
+            SYS_LOC=en-US
+            ---CUR---
+            mSystemLocale=en_US
+            ---SUB---
+            mSubtypeHashCode=-987654
+            locale=ko_KR
+            ---SVC---
+        """.trimIndent()
+        val koStatus = com.example.network.NetworkAdbClient.parseTvImeStatus(koSubLookupDump)
+        assertEquals(com.example.data.model.TvKeyboardLanguage.KOREAN, koStatus.language)
+        assertEquals(com.example.data.model.TvImeType.GBOARD, koStatus.imeType)
+        assertTrue(koStatus.isDetected)
+
+        // Google Korean IME service flag hangul=false -> ENGLISH
+        val koImeEnglishDump = """
+            CUR_IME=com.google.android.inputmethod.korean/.KoreanIME
+            CUR_SUB=
+            SYS_LOC=ko-KR
+            ---CUR---
+            ---SUB---
+            ---SVC---
+            mHangul=false
+        """.trimIndent()
+        val koImeEn = com.example.network.NetworkAdbClient.parseTvImeStatus(koImeEnglishDump)
+        assertEquals(com.example.data.model.TvKeyboardLanguage.ENGLISH, koImeEn.language)
+        assertEquals(com.example.data.model.TvImeType.GOOGLE_KOREAN, koImeEn.imeType)
+        assertTrue(koImeEn.isDetected)
+
+        // Keycombination and Ctrl+A -> DEL command builders
+        assertEquals(null, com.example.network.NetworkAdbClient.buildKeyCombinationShellCommand(TvKeyCodes.KEYCODE_A))
+        assertEquals(
+            "input keycombination 113 29 2>&1",
+            com.example.network.NetworkAdbClient.buildKeyCombinationShellCommand(TvKeyCodes.CTRL_LEFT, TvKeyCodes.KEYCODE_A)
+        )
+        val selectAllDeleteCmd = com.example.network.NetworkAdbClient.buildSelectAllAndDeleteShellCommand()
+        assertTrue(selectAllDeleteCmd.contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}"))
+        assertTrue(selectAllDeleteCmd.contains("input keyevent ${TvKeyCodes.DEL} 2>&1"))
+        assertTrue(selectAllDeleteCmd.contains("input keyevent 123"))
     }
 }

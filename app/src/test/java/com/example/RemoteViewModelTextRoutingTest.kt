@@ -8,6 +8,9 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.AppDatabase
 import com.example.data.local.TvRemoteRepository
+import com.example.data.model.TvImeKeycodeMap
+import com.example.data.model.TvImeType
+import com.example.data.model.TvKeyboardLanguage
 import com.example.data.model.TvKeyCodes
 import com.example.network.AdbKeyManager
 import com.example.network.AndroidTvRemoteClient
@@ -16,7 +19,6 @@ import com.example.network.NetworkAdbClient
 import com.example.network.ProtobufWire
 import com.example.network.TvDiscoveryManager
 import com.example.ui.RemoteViewModel
-import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -134,7 +136,6 @@ class RemoteViewModelTextRoutingTest {
                 sentChunks.add(bytes)
             }
 
-            // "전체 지우기" (submitWithEnter = false): emits empty RemoteImeBatchEdit
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = false)
             waitUntil(timeoutMs = 2_000) { sentChunks.size >= 1 }
             val clearFields = ProtobufWire.parseFields(
@@ -173,95 +174,6 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `adbKeyboard installed routes Send through ADB_CLEAR_TEXT and ADB_INPUT_TEXT or B64 and Enter even when empty`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
-            .allowMainThreadQueries()
-            .build()
-        val store = ViewModelStore()
-
-        try {
-            val factory = RemoteViewModel.Factory(
-                repository = TvRemoteRepository(db),
-                certStore = ClientCertStore(context),
-                discoveryManager = TvDiscoveryManager(context),
-                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
-            )
-            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
-
-            val protocolSent = CopyOnWriteArrayList<ByteArray>()
-            val adbCommands = CopyOnWriteArrayList<String>()
-            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
-            viewModel.configureAdbClientForTest(connected = true) { cmd ->
-                adbCommands.add(cmd)
-                if (cmd.contains("pm path com.android.adbkeyboard")) {
-                    Result.success("ADBKB=INSTALLED")
-                } else {
-                    Result.success("Broadcasting: Intent { act=... }\nBroadcast completed: result=0")
-                }
-            }
-
-            // ASCII Send: uses ADB_CLEAR_TEXT + ADB_INPUT_TEXT + ENTER instead of Protocol v2
-            viewModel.sendKeyboardText("bts", replaceExisting = true, submitWithEnter = true)
-            waitUntil(timeoutMs = 3_000) {
-                adbCommands.any { it.contains("ADB_INPUT_TEXT") } && viewModel.snackbarNotice.value != null
-            }
-            assertEquals(0, protocolSent.size)
-            val asciiSendCmd = adbCommands.first { it.contains("ADB_INPUT_TEXT") }
-            assertTrue(asciiSendCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-            assertTrue(asciiSendCmd.contains("am broadcast -a ADB_INPUT_TEXT --es msg 'bts' 2>&1"))
-            assertTrue(asciiSendCmd.contains("input keyevent 66 2>&1"))
-            assertEquals("ADBKeyBoard로 입력을 전송했습니다.", viewModel.snackbarNotice.value?.message)
-
-            adbCommands.clear()
-            viewModel.clearSnackbar()
-
-            // Korean Send: uses ADB_CLEAR_TEXT + ADB_INPUT_B64 + ENTER (per ADBKeyBoard README 1.1)
-            viewModel.sendKeyboardText("유튜브 검색", replaceExisting = true, submitWithEnter = true)
-            waitUntil(timeoutMs = 3_000) {
-                adbCommands.any { it.contains("ADB_INPUT_B64") } && viewModel.snackbarNotice.value != null
-            }
-            assertEquals(0, protocolSent.size)
-            val expectedB64 = AdbKeyManager.encodeBase64("유튜브 검색".toByteArray(Charsets.UTF_8))
-            val koSendCmd = adbCommands.first { it.contains("ADB_INPUT_B64") }
-            assertTrue(koSendCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-            assertTrue(koSendCmd.contains("am broadcast -a ADB_INPUT_B64 --es msg '$expectedB64' 2>&1"))
-            assertTrue(koSendCmd.contains("input keyevent 66 2>&1"))
-
-            adbCommands.clear()
-            viewModel.clearSnackbar()
-
-            // Empty Send: still runs ADB_CLEAR_TEXT -> ENTER
-            viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
-            waitUntil(timeoutMs = 2_000) { adbCommands.any { it.contains("ADB_CLEAR_TEXT") } }
-            val emptySendCmd = adbCommands.first()
-            assertTrue(emptySendCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-            assertFalse(emptySendCmd.contains("ADB_INPUT_TEXT"))
-            assertTrue(emptySendCmd.contains("input keyevent 66 2>&1"))
-
-            adbCommands.clear()
-
-            // Clear button: ADB_CLEAR_TEXT only (no Enter)
-            viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = false)
-            waitUntil(timeoutMs = 2_000) { adbCommands.any { it.contains("ADB_CLEAR_TEXT") } }
-            val clearCmd = adbCommands.first()
-            assertTrue(clearCmd.contains("am broadcast -a ADB_CLEAR_TEXT 2>&1"))
-            assertFalse(clearCmd.contains("input keyevent 66"))
-
-            // Physical Backspace sends KEYCODE_DEL immediately over Protocol v2
-            viewModel.sendKeyboardBackspace(1)
-            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
-            val backspaceFrame = ProtobufWire.parseFields(
-                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
-            ).first { it.number == 10 }.asMessage()
-            assertEquals(TvKeyCodes.DEL.toLong(), backspaceFrame.first { it.number == 1 }.varint)
-        } finally {
-            store.clear()
-            db.close()
-        }
-    }
-
-    @Test
     fun `raw ADB fallback still clears before Enter on empty Send and routes Backspace to DEL`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
@@ -283,11 +195,7 @@ class RemoteViewModelTextRoutingTest {
             }
             viewModel.configureAdbClientForTest(connected = true) { cmd ->
                 adbCommands.add(cmd)
-                if (cmd.contains("pm path com.android.adbkeyboard")) {
-                    Result.success("ADBKB=MISSING")
-                } else {
-                    Result.success("")
-                }
+                Result.success("")
             }
 
             viewModel.sendKeyboardText("", replaceExisting = true, submitWithEnter = true)
@@ -311,7 +219,7 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `first connect when ADBKeyBoard missing emits v2_4_dev URL and opens setup dialog only once`() {
+    fun `tv IME detection syncs initial language and physical keys plus toggleLanguage emit correct keycodes`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -319,46 +227,90 @@ class RemoteViewModelTextRoutingTest {
         val store = ViewModelStore()
 
         try {
-            val repo = TvRemoteRepository(db)
             val factory = RemoteViewModel.Factory(
-                repository = repo,
+                repository = TvRemoteRepository(db),
                 certStore = ClientCertStore(context),
                 discoveryManager = TvDiscoveryManager(context),
                 adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
             )
             val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
-            val openedUrls = CopyOnWriteArrayList<String>()
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
 
-            val collectJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined).launch {
-                viewModel.openUrlRequests.collect { url -> openedUrls.add(url) }
-            }
-
-            viewModel.configureAdbClientForTest(connected = true) { cmd ->
-                if (cmd.contains("pm path com.android.adbkeyboard")) {
-                    Result.success("ADBKB=MISSING")
-                } else {
-                    Result.success("")
-                }
+            var imeDump = """
+                CUR_IME=com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+                CUR_SUB=777
+                SYS_LOC=ko-KR
+                ---CUR---
+                mCurrentSubtype=InputMethodSubtype@1 mSubtypeLocale=ko_KR
+                ---SUB---
+                ---SVC---
+            """.trimIndent()
+            viewModel.configureAdbClientForTest(connected = true) {
+                Result.success(imeDump)
             }
 
             kotlinx.coroutines.runBlocking {
-                viewModel.checkAdbKeyboardOnConnectForTest()
+                viewModel.refreshTvImeStatusForTest()
             }
 
-            assertEquals(false, viewModel.adbKeyboardInstalled.value)
-            assertTrue(viewModel.isAdbKeyboardSetupDialogVisible.value)
-            assertEquals(listOf(NetworkAdbClient.ADB_KEYBOARD_APK_URL), openedUrls)
-            assertTrue(kotlinx.coroutines.runBlocking { repo.getPreferencesOnce().hasPromptedAdbKeyboardSetup })
+            assertEquals(TvKeyboardLanguage.KOREAN, viewModel.keyboardLanguage.value)
+            assertEquals(TvImeType.GBOARD, viewModel.tvImeStatus.value.imeType)
+            assertTrue(viewModel.tvImeStatus.value.isDetected)
 
-            // Subsequent connects do not auto-open browser repeatedly once dismissed
-            viewModel.dismissAdbKeyboardSetupDialog()
-            kotlinx.coroutines.runBlocking {
-                viewModel.checkAdbKeyboardOnConnectForTest()
+            // Pressing ㅂ (id="q") sends KEYCODE_Q (45) without Shift
+            viewModel.sendPhysicalKey(TvImeKeycodeMap.findSpecById("q")!!, shift = false)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
+            val keyMsg = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
+            ).first { it.number == 10 }.asMessage()
+            assertEquals(TvKeyCodes.KEYCODE_Q.toLong(), keyMsg.first { it.number == 1 }.varint)
+            assertEquals(AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyMsg.first { it.number == 2 }.varint)
+
+            // Toggling language on Gboard switches to ENGLISH and sends KEYCODE_LANGUAGE_SWITCH (204)
+            protocolSent.clear()
+            viewModel.toggleKeyboardLanguage()
+            assertEquals(TvKeyboardLanguage.ENGLISH, viewModel.keyboardLanguage.value)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 1 }
+            val switchMsg = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[0]))
+            ).first { it.number == 10 }.asMessage()
+            assertEquals(TvKeyCodes.LANGUAGE_SWITCH.toLong(), switchMsg.first { it.number == 1 }.varint)
+
+            // Shifted Q sends SHIFT_LEFT START -> Q SHORT -> SHIFT_LEFT END
+            protocolSent.clear()
+            viewModel.sendPhysicalKey(TvImeKeycodeMap.findSpecById("q")!!, shift = true)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 3 }
+            fun codeAt(i: Int): Long = ProtobufWire.parseFields(
+                ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[i]))
+            ).first { it.number == 10 }.asMessage().first { it.number == 1 }.varint
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(0))
+            assertEquals(TvKeyCodes.KEYCODE_Q.toLong(), codeAt(1))
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(2))
+
+            // Resync onto Google Korean IME -> switching language uses SHIFT_LEFT + SPACE
+            imeDump = """
+                CUR_IME=com.google.android.inputmethod.korean/.KoreanIME
+                CUR_SUB=
+                SYS_LOC=ko-KR
+                ---CUR---
+                ---SUB---
+                ---SVC---
+                mHangul=true
+            """.trimIndent()
+            viewModel.resyncTvImeLanguage()
+            waitUntil(timeoutMs = 2_000) {
+                viewModel.tvImeStatus.value.imeType == TvImeType.GOOGLE_KOREAN &&
+                    viewModel.keyboardLanguage.value == TvKeyboardLanguage.KOREAN
             }
-            assertFalse(viewModel.isAdbKeyboardSetupDialogVisible.value)
-            assertEquals(1, openedUrls.size)
 
-            collectJob.cancel()
+            protocolSent.clear()
+            viewModel.toggleKeyboardLanguage()
+            assertEquals(TvKeyboardLanguage.ENGLISH, viewModel.keyboardLanguage.value)
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 3 }
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(0))
+            assertEquals(TvKeyCodes.SPACE.toLong(), codeAt(1))
+            assertEquals(TvKeyCodes.SHIFT_LEFT.toLong(), codeAt(2))
         } finally {
             store.clear()
             db.close()
@@ -366,9 +318,63 @@ class RemoteViewModelTextRoutingTest {
     }
 
     @Test
-    fun `room migration 2 to 3 adds hasPromptedAdbKeyboardSetup without wiping paired tvs`() {
+    fun `clearKeyboardWithSelectAllDelete sends Ctrl+A then DEL over Protocol v2 and falls back to ADB`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val dbName = "migration_2_3_test_${System.nanoTime()}.db"
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val store = ViewModelStore()
+
+        try {
+            val factory = RemoteViewModel.Factory(
+                repository = TvRemoteRepository(db),
+                certStore = ClientCertStore(context),
+                discoveryManager = TvDiscoveryManager(context),
+                adbClient = NetworkAdbClient(AdbKeyManager(context.filesDir))
+            )
+            val viewModel = ViewModelProvider(store, factory)[RemoteViewModel::class.java]
+            val protocolSent = CopyOnWriteArrayList<ByteArray>()
+            viewModel.configureRemoteClientForTest(connected = true) { protocolSent.add(it) }
+
+            viewModel.clearKeyboardWithSelectAllDelete()
+            waitUntil(timeoutMs = 2_000) { protocolSent.size >= 4 }
+
+            fun keyAndDirAt(i: Int): Pair<Long, Long> {
+                val msg = ProtobufWire.parseFields(
+                    ProtobufWire.readFramedMessage(ByteArrayInputStream(protocolSent[i]))
+                ).first { it.number == 10 }.asMessage()
+                return msg.first { it.number == 1 }.varint to msg.first { it.number == 2 }.varint
+            }
+            assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_START_LONG.toLong(), keyAndDirAt(0))
+            assertEquals(TvKeyCodes.KEYCODE_A.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(1))
+            assertEquals(TvKeyCodes.CTRL_LEFT.toLong() to AndroidTvRemoteClient.DIRECTION_END_LONG.toLong(), keyAndDirAt(2))
+            assertEquals(TvKeyCodes.DEL.toLong() to AndroidTvRemoteClient.DIRECTION_SHORT.toLong(), keyAndDirAt(3))
+
+            // ADB fallback when Protocol v2 write drops
+            val adbCommands = CopyOnWriteArrayList<String>()
+            viewModel.configureRemoteClientForTest(connected = true) {
+                throw java.io.IOException("simulated Protocol v2 write drop")
+            }
+            viewModel.configureAdbClientForTest(connected = true) { cmd ->
+                adbCommands.add(cmd)
+                Result.success("")
+            }
+            viewModel.clearKeyboardWithSelectAllDelete()
+            waitUntil(timeoutMs = 3_000) {
+                adbCommands.any { it.contains("input keycombination ${TvKeyCodes.CTRL_LEFT} ${TvKeyCodes.KEYCODE_A}") }
+            }
+            val cmd = adbCommands.first { it.contains("input keycombination") }
+            assertTrue(cmd.contains("input keyevent ${TvKeyCodes.DEL}"))
+        } finally {
+            store.clear()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `room migration 2 to 4 removes hasPromptedAdbKeyboardSetup while preserving paired tvs and prefs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val dbName = "migration_2_4_test_${System.nanoTime()}.db"
         val dbFile = context.getDatabasePath(dbName)
         dbFile.parentFile?.mkdirs()
 
@@ -393,7 +399,7 @@ class RemoteViewModelTextRoutingTest {
         rawHelper.close()
 
         val upgradedDb = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_2_3)
+            .addMigrations(AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
             .allowMainThreadQueries()
             .build()
 
@@ -404,8 +410,18 @@ class RemoteViewModelTextRoutingTest {
                 assertEquals("192.168.1.55", tv?.host)
                 val prefs = repo.getPreferencesOnce()
                 assertEquals(75, prefs.brightnessPercent)
-                assertFalse(prefs.hasPromptedAdbKeyboardSetup)
+                assertTrue(prefs.hapticEnabled)
+                assertTrue(prefs.autoShowKeyboard)
             }
+            val columns = mutableListOf<String>()
+            upgradedDb.openHelper.readableDatabase.query("PRAGMA table_info(`app_preferences`)").use { cursor ->
+                val nameCol = cursor.getColumnIndex("name")
+                while (cursor.moveToNext()) {
+                    columns.add(cursor.getString(nameCol))
+                }
+            }
+            assertFalse(columns.contains("hasPromptedAdbKeyboardSetup"))
+            assertTrue(columns.containsAll(listOf("id", "hapticEnabled", "autoShowKeyboard", "brightnessPercent")))
         } finally {
             upgradedDb.close()
             dbFile.delete()

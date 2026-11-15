@@ -49,6 +49,5 @@ data class AppPreferencesEntity(
     @PrimaryKey val id: Int = 1,
     val hapticEnabled: Boolean = true,
     val autoShowKeyboard: Boolean = true,
-    val brightnessPercent: Int = 60,
-    val hasPromptedAdbKeyboardSetup: Boolean = false
+    val brightnessPercent: Int = 60
 )

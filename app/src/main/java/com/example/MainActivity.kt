@@ -3,7 +3,6 @@ package com.example
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -21,7 +20,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -34,14 +32,10 @@ import com.example.data.model.TvConnectionState
 import com.example.ui.RemoteScreen
 import com.example.ui.RemoteViewModel
 import com.example.ui.SettingsScreen
-import com.example.ui.components.AdbKeyboardSetupDialog
 import com.example.ui.components.KeyboardInputSheet
 import com.example.ui.components.PairingPinDialog
 import com.example.ui.components.TvConnectionSheet
 import com.example.ui.theme.TvRemoteTheme
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 const val ROUTE_REMOTE = "remote"
 const val ROUTE_SETTINGS = "settings"
@@ -62,7 +56,6 @@ class MainActivity : ComponentActivity() {
                 val context = LocalContext.current
                 val navController = rememberNavController()
                 val snackbarHostState = remember { SnackbarHostState() }
-                val ioScope = rememberCoroutineScope()
 
                 val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
                 val discoveredTvs by viewModel.discoveredTvs.collectAsStateWithLifecycle()
@@ -76,16 +69,14 @@ class MainActivity : ComponentActivity() {
                 val maxVolume by viewModel.maxVolume.collectAsStateWithLifecycle()
                 val isMuted by viewModel.isMuted.collectAsStateWithLifecycle()
                 val imePromptState by viewModel.imePromptState.collectAsStateWithLifecycle()
+                val tvImeStatus by viewModel.tvImeStatus.collectAsStateWithLifecycle()
+                val keyboardLanguage by viewModel.keyboardLanguage.collectAsStateWithLifecycle()
                 val isKeyboardSheetVisible by viewModel.isKeyboardSheetVisible.collectAsStateWithLifecycle()
                 val isTvPickerVisible by viewModel.isTvPickerVisible.collectAsStateWithLifecycle()
                 val isVoiceListening by viewModel.isVoiceListening.collectAsStateWithLifecycle()
                 val snackbarNotice by viewModel.snackbarNotice.collectAsStateWithLifecycle()
                 val adbState by viewModel.adbState.collectAsStateWithLifecycle()
                 val adbStatusDetail by viewModel.adbStatusDetail.collectAsStateWithLifecycle()
-                val adbKeyboardInstalled by viewModel.adbKeyboardInstalled.collectAsStateWithLifecycle()
-                val isAdbKeyboardSetupDialogVisible by viewModel.isAdbKeyboardSetupDialogVisible.collectAsStateWithLifecycle()
-                val adbKeyboardSetupStatus by viewModel.adbKeyboardSetupStatus.collectAsStateWithLifecycle()
-                val isInstallingAdbKeyboard by viewModel.isInstallingAdbKeyboard.collectAsStateWithLifecycle()
 
                 LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
                     viewModel.autoReconnectIfNeeded()
@@ -109,36 +100,6 @@ class MainActivity : ComponentActivity() {
                         notice.onAction?.invoke()
                     }
                     viewModel.clearSnackbar()
-                }
-
-                LaunchedEffect(viewModel) {
-                    viewModel.openUrlRequests.collect { url ->
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        val launched = runCatching { context.startActivity(intent) }.isSuccess
-                        if (!launched) {
-                            viewModel.showMessage("인터넷 브라우저를 열 수 없습니다. 직접 다운로드해 주세요.")
-                        }
-                    }
-                }
-
-                val apkPickerLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.OpenDocument()
-                ) { uri: Uri? ->
-                    if (uri == null) return@rememberLauncherForActivityResult
-                    ioScope.launch {
-                        val bytes = withContext(Dispatchers.IO) {
-                            runCatching {
-                                context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                            }.getOrNull()
-                        }
-                        if (bytes == null || bytes.isEmpty()) {
-                            viewModel.showMessage("선택한 APK 파일을 읽을 수 없습니다.")
-                        } else {
-                            viewModel.installAdbKeyboardFromLocalApkBytes(bytes)
-                        }
-                    }
                 }
 
                 // On-device SpeechRecognizer fallback (used only when TV does not open RemoteVoiceBegin)
@@ -309,10 +270,8 @@ class MainActivity : ComponentActivity() {
                         connectionState = connectionState,
                         adbState = adbState,
                         adbStatusDetail = adbStatusDetail,
-                        adbKeyboardInstalled = adbKeyboardInstalled,
                         onRefreshScan = viewModel::refreshDiscovery,
                         onRetryAdb = viewModel::retryAdbConnect,
-                        onOpenAdbKeyboardSetup = viewModel::openAdbKeyboardSetupDialog,
                         onConnectTv = { host, name, rPort, pPort ->
                             viewModel.connectToTv(host, name, rPort, pPort)
                         },
@@ -340,33 +299,16 @@ class MainActivity : ComponentActivity() {
                         initialText = imePromptState.currentText,
                         isTvImeVisible = imePromptState.isTvImeVisible,
                         isAdbConnected = adbState == com.example.network.AdbConnectionState.CONNECTED,
-                        isAdbKeyboardInstalled = adbKeyboardInstalled,
-                        onOpenAdbKeyboardSetup = viewModel::openAdbKeyboardSetupDialog,
+                        keyboardLanguage = keyboardLanguage,
+                        tvImeStatus = tvImeStatus,
+                        onToggleLanguage = viewModel::toggleKeyboardLanguage,
+                        onResyncTvIme = viewModel::resyncTvImeLanguage,
+                        onPhysicalKeyPress = viewModel::sendPhysicalKey,
+                        onClearAll = viewModel::clearKeyboardWithSelectAllDelete,
                         onSendText = viewModel::sendKeyboardText,
                         onBackspace = viewModel::sendKeyboardBackspace,
-                        onSendKey = viewModel::sendKey,
+                        onSendKey = { code -> viewModel.sendPhysicalKeyCode(code) },
                         onDismiss = viewModel::dismissKeyboardSheet
-                    )
-                }
-
-                if (isAdbKeyboardSetupDialogVisible) {
-                    AdbKeyboardSetupDialog(
-                        isInstalled = adbKeyboardInstalled,
-                        statusMessage = adbKeyboardSetupStatus,
-                        isInstalling = isInstallingAdbKeyboard,
-                        onPickApkFromDownloads = {
-                            apkPickerLauncher.launch(
-                                arrayOf(
-                                    "application/vnd.android.package-archive",
-                                    "application/octet-stream",
-                                    "*/*"
-                                )
-                            )
-                        },
-                        onOpenTvDownloads = viewModel::openTvDownloadFolderForApk,
-                        onRedownloadInBrowser = viewModel::redownloadAdbKeyboardApk,
-                        onVerifyInstalled = viewModel::verifyAdbKeyboardInstallation,
-                        onDismiss = viewModel::dismissAdbKeyboardSetupDialog
                     )
                 }
             }

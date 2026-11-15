@@ -9,10 +9,15 @@ import com.example.data.local.PairedTvEntity
 import com.example.data.local.RecentTvAppEntity
 import com.example.data.local.TvRemoteRepository
 import com.example.data.model.DiscoveredTv
+import com.example.data.model.PhysicalKeyAction
+import com.example.data.model.PhysicalKeySpec
 import com.example.data.model.TvAppCatalog
 import com.example.data.model.TvAppCatalogItem
 import com.example.data.model.TvConnectionState
+import com.example.data.model.TvImeKeycodeMap
 import com.example.data.model.TvImePromptState
+import com.example.data.model.TvImeStatus
+import com.example.data.model.TvKeyboardLanguage
 import com.example.data.model.TvKeyCodes
 import com.example.network.AdbAppLaunchOutcome
 import com.example.network.AdbConnectionState
@@ -88,6 +93,12 @@ class RemoteViewModel(
     private val _imePromptState = MutableStateFlow(TvImePromptState())
     val imePromptState: StateFlow<TvImePromptState> = _imePromptState.asStateFlow()
 
+    private val _tvImeStatus = MutableStateFlow(TvImeStatus())
+    val tvImeStatus: StateFlow<TvImeStatus> = _tvImeStatus.asStateFlow()
+
+    private val _keyboardLanguage = MutableStateFlow(TvKeyboardLanguage.ENGLISH)
+    val keyboardLanguage: StateFlow<TvKeyboardLanguage> = _keyboardLanguage.asStateFlow()
+
     private val _isKeyboardSheetVisible = MutableStateFlow(false)
     val isKeyboardSheetVisible: StateFlow<Boolean> = _isKeyboardSheetVisible.asStateFlow()
 
@@ -109,21 +120,7 @@ class RemoteViewModel(
     private val _snackbarNotice = MutableStateFlow<SnackbarNotice?>(null)
     val snackbarNotice: StateFlow<SnackbarNotice?> = _snackbarNotice.asStateFlow()
 
-    private val _adbKeyboardInstalled = MutableStateFlow<Boolean?>(null)
-    val adbKeyboardInstalled: StateFlow<Boolean?> = _adbKeyboardInstalled.asStateFlow()
-
-    private val _isAdbKeyboardSetupDialogVisible = MutableStateFlow(false)
-    val isAdbKeyboardSetupDialogVisible: StateFlow<Boolean> = _isAdbKeyboardSetupDialogVisible.asStateFlow()
-
-    private val _adbKeyboardSetupStatus = MutableStateFlow<String?>(null)
-    val adbKeyboardSetupStatus: StateFlow<String?> = _adbKeyboardSetupStatus.asStateFlow()
-
-    private val _isInstallingAdbKeyboard = MutableStateFlow(false)
-    val isInstallingAdbKeyboard: StateFlow<Boolean> = _isInstallingAdbKeyboard.asStateFlow()
-
-    private val _openUrlRequests = Channel<String>(Channel.BUFFERED)
-    val openUrlRequests: Flow<String> = _openUrlRequests.receiveAsFlow()
-
+    private var hasUserManuallyToggledLanguage: Boolean = false
     private var lastAutoReconnectAttemptMs: Long = 0L
     private var lastLocalVolumeAdjustMs: Long = 0L
     private var lastTvReportedVolume: Int? = null
@@ -169,6 +166,11 @@ class RemoteViewModel(
                 currentText = currentText,
                 fieldCounter = fieldCounter
             )
+            if (adbClient.isConnected) {
+                viewModelScope.launch {
+                    refreshTvImeStatusInternal(syncLanguage = !hasUserManuallyToggledLanguage)
+                }
+            }
             if (preferences.value.autoShowKeyboard) {
                 _isKeyboardSheetVisible.value = true
             }
@@ -217,7 +219,9 @@ class RemoteViewModel(
             stopVoiceSession(sendEndPacket = false)
             adbConnectJob?.cancel()
             adbClient.disconnect()
-            _adbKeyboardInstalled.value = null
+            hasUserManuallyToggledLanguage = false
+            _tvImeStatus.value = TvImeStatus()
+            _keyboardLanguage.value = TvKeyboardLanguage.ENGLISH
             _imePromptState.value = TvImePromptState()
             _connectionState.value = if (cause != null) {
                 TvConnectionState.Error(cause.message ?: "TV 연결이 끊어졌습니다.")
@@ -269,24 +273,20 @@ class RemoteViewModel(
         adbConnectJob = viewModelScope.launch {
             val connected = adbClient.connect(host, NetworkAdbClient.DEFAULT_ADB_PORT)
             if (connected) {
-                refreshAdbKeyboardStatusOnConnect()
+                refreshTvImeStatusInternal(syncLanguage = !hasUserManuallyToggledLanguage)
             } else {
-                _adbKeyboardInstalled.value = null
+                _tvImeStatus.value = TvImeStatus()
             }
         }
     }
 
-    private suspend fun refreshAdbKeyboardStatusOnConnect() {
-        val installed = adbClient.checkAdbKeyboardInstalled(forceRefresh = true)
-        _adbKeyboardInstalled.value = installed
-        if (installed == false) {
-            val prefs = repository.getPreferencesOnce()
-            if (!prefs.hasPromptedAdbKeyboardSetup) {
-                repository.markAdbKeyboardPrompted()
-                _adbKeyboardSetupStatus.value =
-                    "TV에 ADBKeyBoard가 설치되어 있지 않습니다. 열린 인터넷 창에서 받은 Download 폴더의 keyboardservice-debug.apk 파일을 TV에서 열어 설치해 주세요."
-                _isAdbKeyboardSetupDialogVisible.value = true
-                _openUrlRequests.trySend(NetworkAdbClient.ADB_KEYBOARD_APK_URL)
+    private suspend fun refreshTvImeStatusInternal(syncLanguage: Boolean) {
+        val statusRes = adbClient.readTvImeStatus()
+        if (statusRes.isSuccess) {
+            val status = statusRes.getOrThrow()
+            _tvImeStatus.value = status
+            if (syncLanguage) {
+                _keyboardLanguage.value = status.language
             }
         }
     }
@@ -315,7 +315,9 @@ class RemoteViewModel(
         if (current is TvConnectionState.Connected || current is TvConnectionState.Connecting) {
             adbClient.disconnect()
             remoteClient.disconnect(notify = false)
-            _adbKeyboardInstalled.value = null
+            hasUserManuallyToggledLanguage = false
+            _tvImeStatus.value = TvImeStatus()
+            _keyboardLanguage.value = TvKeyboardLanguage.ENGLISH
             _imePromptState.value = TvImePromptState()
             _connectionState.value = TvConnectionState.Disconnected
         }
@@ -498,7 +500,9 @@ class RemoteViewModel(
         adbConnectJob?.cancel()
         adbClient.disconnect()
         remoteClient.disconnect(notify = false)
-        _adbKeyboardInstalled.value = null
+        hasUserManuallyToggledLanguage = false
+        _tvImeStatus.value = TvImeStatus()
+        _keyboardLanguage.value = TvKeyboardLanguage.ENGLISH
         _connectionState.value = TvConnectionState.Disconnected
         showMessage("TV 연결이 해제되었습니다.")
     }
@@ -510,7 +514,9 @@ class RemoteViewModel(
                 adbConnectJob?.cancel()
                 adbClient.disconnect()
                 remoteClient.disconnect(notify = false)
-                _adbKeyboardInstalled.value = null
+                hasUserManuallyToggledLanguage = false
+                _tvImeStatus.value = TvImeStatus()
+                _keyboardLanguage.value = TvKeyboardLanguage.ENGLISH
                 _connectionState.value = TvConnectionState.Disconnected
             }
             repository.removePairedTv(host)
@@ -654,6 +660,17 @@ class RemoteViewModel(
     fun openKeyboardSheet() {
         if (!ensureConnectedOrPrompt()) return
         _isKeyboardSheetVisible.value = true
+        val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
+        if (adbClient.isConnected || !connectedHost.isNullOrBlank()) {
+            viewModelScope.launch {
+                if (!adbClient.isConnected && !connectedHost.isNullOrBlank()) {
+                    adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
+                }
+                if (adbClient.isConnected) {
+                    refreshTvImeStatusInternal(syncLanguage = !hasUserManuallyToggledLanguage)
+                }
+            }
+        }
     }
 
     fun dismissKeyboardSheet() {
@@ -674,111 +691,113 @@ class RemoteViewModel(
         }
     }
 
-    fun openAdbKeyboardSetupDialog() {
-        val status = when (_adbKeyboardInstalled.value) {
-            true -> "TV에 ADBKeyBoard가 설치되어 있습니다. 정상 작동하지 않으면 '설치 확인'을 눌러 다시 활성화하세요."
-            false -> "인터넷 창에서 다운로드된 Download 폴더의 keyboardservice-debug.apk 파일을 TV에서 열어 설치한 뒤 '설치 확인'을 눌러주세요."
-            null -> "TV용 한글 입력을 위해 Download 폴더의 keyboardservice-debug.apk 파일을 TV에 설치해 주세요."
-        }
-        _adbKeyboardSetupStatus.value = status
-        _isAdbKeyboardSetupDialogVisible.value = true
-    }
-
-    fun dismissAdbKeyboardSetupDialog() {
-        _isAdbKeyboardSetupDialogVisible.value = false
-    }
-
-    fun redownloadAdbKeyboardApk() {
-        _adbKeyboardSetupStatus.value =
-            "인터넷 창에서 keyboardservice-debug.apk 다운로드를 시작합니다. 완료 후 Download 폴더의 파일을 TV에 설치해 주세요."
-        _openUrlRequests.trySend(NetworkAdbClient.ADB_KEYBOARD_APK_URL)
-    }
-
-    fun verifyAdbKeyboardInstallation() {
+    /**
+     * Executes "(1) Select All (Ctrl+A) -> (2) Delete (DEL)" on the focused TV text field.
+     */
+    fun clearKeyboardWithSelectAllDelete() {
+        _imePromptState.update { it.copy(currentText = "") }
+        if (!ensureConnectedOrPrompt()) return
         val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
+        viewModelScope.launch {
+            if (remoteClient.isConnected) {
+                val res = runCatching { remoteClient.selectAllAndDelete() }
+                if (res.isSuccess) {
+                    lastAdbSentTextLength = 0
+                    return@launch
+                }
+            }
+            if (!adbClient.isConnected && !connectedHost.isNullOrBlank()) {
+                adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
+            }
+            if (adbClient.isConnected && adbClient.selectAllAndDelete().isSuccess) {
+                lastAdbSentTextLength = 0
+                return@launch
+            }
+            showMessage("전체 지우기 전송 실패: TV 연결 상태를 확인해 주세요.")
+        }
+    }
+
+    fun sendPhysicalKey(spec: PhysicalKeySpec, shift: Boolean = false) {
+        if (!ensureConnectedOrPrompt()) return
+        val action = TvImeKeycodeMap.resolveKeyAction(
+            imeType = _tvImeStatus.value.imeType,
+            language = _keyboardLanguage.value,
+            spec = spec,
+            shifted = shift
+        )
+        sendPhysicalKeyAction(action)
+    }
+
+    fun sendPhysicalKeyCode(keyCode: Int, shift: Boolean = false, ctrl: Boolean = false) {
+        if (!ensureConnectedOrPrompt()) return
+        sendPhysicalKeyAction(PhysicalKeyAction(keyCode = keyCode, shift = shift, ctrl = ctrl))
+    }
+
+    fun toggleKeyboardLanguage() {
+        hasUserManuallyToggledLanguage = true
+        val next = if (_keyboardLanguage.value == TvKeyboardLanguage.KOREAN) {
+            TvKeyboardLanguage.ENGLISH
+        } else {
+            TvKeyboardLanguage.KOREAN
+        }
+        _keyboardLanguage.value = next
+        if (!remoteClient.isConnected && !adbClient.isConnected) return
+        val switchAction = TvImeKeycodeMap.resolveLanguageSwitchAction(_tvImeStatus.value.imeType)
+        sendPhysicalKeyAction(switchAction)
+    }
+
+    fun resyncTvImeLanguage() {
+        val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
+        hasUserManuallyToggledLanguage = false
         viewModelScope.launch {
             if (!adbClient.isConnected && !connectedHost.isNullOrBlank()) {
                 adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
             }
-            val installed = adbClient.checkAdbKeyboardInstalled(forceRefresh = true)
-            _adbKeyboardInstalled.value = installed
-            when (installed) {
-                true -> {
-                    _adbKeyboardSetupStatus.value = "ADBKeyBoard 설치 및 활성화가 확인되었습니다."
-                    _isAdbKeyboardSetupDialogVisible.value = false
-                    showMessage("ADBKeyBoard 설치가 확인되었습니다. 한글 입력 및 전체 전송이 가능합니다.")
-                }
-                false -> {
-                    _adbKeyboardSetupStatus.value =
-                        "아직 TV에 ADBKeyBoard가 설치되지 않았습니다. Download 폴더의 keyboardservice-debug.apk 파일을 TV에서 열어 설치한 뒤 다시 확인해 주세요."
-                }
-                null -> {
-                    _adbKeyboardSetupStatus.value =
-                        "TV ADB(5555)가 연결되어 있지 않습니다. TV 개발자 옵션에서 네트워크 디버깅을 허용해 주세요."
-                }
+            if (adbClient.isConnected) {
+                refreshTvImeStatusInternal(syncLanguage = true)
+                val status = _tvImeStatus.value
+                val langLabel = if (status.language == TvKeyboardLanguage.KOREAN) "한글" else "영문"
+                showMessage("TV IME 동기화: $langLabel (${status.imeType.displayName})")
+            } else {
+                showMessage("TV IME 상태를 읽으려면 ADB(5555) 연결이 필요합니다.")
             }
         }
     }
 
-    fun openTvDownloadFolderForApk() {
+    private fun sendPhysicalKeyAction(action: PhysicalKeyAction) {
         val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
         viewModelScope.launch {
+            if (remoteClient.isConnected) {
+                val res = runCatching {
+                    remoteClient.sendPhysicalKey(
+                        keyCode = action.keyCode,
+                        shift = action.shift,
+                        ctrl = action.ctrl
+                    )
+                }
+                if (res.isSuccess) {
+                    return@launch
+                }
+            }
             if (!adbClient.isConnected && !connectedHost.isNullOrBlank()) {
                 adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
             }
-            if (!adbClient.isConnected) {
-                _adbKeyboardSetupStatus.value =
-                    "TV ADB(5555)가 연결되지 않았습니다. TV 파일 관리자에서 Download/keyboardservice-debug.apk를 직접 실행해 설치해 주세요."
-                return@launch
-            }
-            val res = adbClient.openDownloadFolderOnTv()
-            if (res.isFailure) {
-                _adbKeyboardSetupStatus.value =
-                    "TV Download 열기 실패: ${res.exceptionOrNull()?.message ?: "ADB 오류"}"
-                return@launch
-            }
-            val out = res.getOrDefault("")
-            when {
-                out.contains("TV_DL=INSTALLED") -> {
-                    _adbKeyboardInstalled.value = true
-                    _adbKeyboardSetupStatus.value = "TV Download 폴더의 APK로 ADBKeyBoard를 설치했습니다."
-                    _isAdbKeyboardSetupDialogVisible.value = false
-                    showMessage("ADBKeyBoard가 TV에 설치되었습니다.")
+            if (adbClient.isConnected) {
+                val adbRes = when {
+                    action.ctrl && action.shift ->
+                        adbClient.sendKeyCombination(TvKeyCodes.CTRL_LEFT, TvKeyCodes.SHIFT_LEFT, action.keyCode)
+                    action.ctrl ->
+                        adbClient.sendKeyCombination(TvKeyCodes.CTRL_LEFT, action.keyCode)
+                    action.shift ->
+                        adbClient.sendKeyCombination(TvKeyCodes.SHIFT_LEFT, action.keyCode)
+                    else ->
+                        adbClient.sendKeyEvent(action.keyCode)
                 }
-                out.contains("TV_DL=OPENED_APK") -> {
-                    _adbKeyboardSetupStatus.value =
-                        "TV 화면에서 keyboardservice-debug.apk 설치 창을 열었습니다. 설치 완료 후 '설치 확인'을 눌러주세요."
-                }
-                else -> {
-                    _adbKeyboardSetupStatus.value =
-                        "TV Download 폴더를 열었습니다. keyboardservice-debug.apk 파일을 선택해 설치한 뒤 '설치 확인'을 눌러주세요."
+                if (adbRes.isSuccess) {
+                    return@launch
                 }
             }
-        }
-    }
-
-    fun installAdbKeyboardFromLocalApkBytes(apkBytes: ByteArray) {
-        val connectedHost = (_connectionState.value as? TvConnectionState.Connected)?.host
-        viewModelScope.launch {
-            _isInstallingAdbKeyboard.value = true
-            _adbKeyboardSetupStatus.value = "선택한 APK를 TV로 전송하여 설치 중입니다..."
-            try {
-                if (!adbClient.isConnected && !connectedHost.isNullOrBlank()) {
-                    adbClient.connect(connectedHost, NetworkAdbClient.DEFAULT_ADB_PORT)
-                }
-                val result = adbClient.installApkBytesOnTv(apkBytes)
-                if (result.isSuccess) {
-                    _adbKeyboardInstalled.value = true
-                    _adbKeyboardSetupStatus.value = "ADBKeyBoard가 TV에 설치 및 활성화되었습니다."
-                    _isAdbKeyboardSetupDialogVisible.value = false
-                    showMessage("ADBKeyBoard를 TV에 설치했습니다. 이제 한글 전송이 가능합니다.")
-                } else {
-                    _adbKeyboardSetupStatus.value =
-                        result.exceptionOrNull()?.message ?: "APK 설치에 실패했습니다. TV에서 Download/keyboardservice-debug.apk를 직접 열어 설치해 주세요."
-                }
-            } finally {
-                _isInstallingAdbKeyboard.value = false
-            }
+            showMessage("물리키 전송 실패: TV 연결 상태를 확인해 주세요.")
         }
     }
 
@@ -801,11 +820,9 @@ class RemoteViewModel(
     }
 
     /**
-     * Keyboard Send & Clear routing:
-     * 1) When ADB is connected and ADBKeyBoard is installed: always executes
-     *    `ADB_CLEAR_TEXT` -> optional `ADB_INPUT_TEXT` (ASCII) / `ADB_INPUT_B64` (Korean UTF-8) -> optional `ENTER`,
-     *    even when the input box is empty (`text.isEmpty()`).
-     * 2) Falls back to Protocol v2 (`RemoteImeBatchEdit`), then raw ADB `clear + input text + ENTER`.
+     * Text-field Send routing:
+     * 1) Primary: Protocol v2 (`RemoteImeBatchEdit(21)` full replacement + optional `ENTER`).
+     * 2) Fallback: ADB raw ASCII `input text` / `clearTextField` + optional `ENTER`.
      */
     private suspend fun sendTextViaStandardImeOrAdb(
         host: String?,
@@ -814,33 +831,6 @@ class RemoteViewModel(
         submitWithEnter: Boolean,
         showSuccessMessage: Boolean
     ): Boolean {
-        // Priority 1: ADBKeyBoard when ADB is connected and ADBKeyBoard IME is installed on TV
-        if (adbClient.isConnected && adbClient.hasAdbKeyboardIme()) {
-            _adbKeyboardInstalled.value = true
-            var adbKbResult = adbClient.sendViaAdbKeyboard(
-                text = text,
-                clearExisting = replaceExisting,
-                submitWithEnter = submitWithEnter
-            )
-            if (adbKbResult.isFailure && !adbClient.isConnected && !host.isNullOrBlank()) {
-                if (adbClient.connect(host, NetworkAdbClient.DEFAULT_ADB_PORT) && adbClient.hasAdbKeyboardIme()) {
-                    adbKbResult = adbClient.sendViaAdbKeyboard(
-                        text = text,
-                        clearExisting = replaceExisting,
-                        submitWithEnter = submitWithEnter
-                    )
-                }
-            }
-            if (adbKbResult.isSuccess) {
-                lastAdbSentTextLength = if (submitWithEnter || text.isEmpty()) 0 else text.length
-                if (showSuccessMessage) {
-                    showMessage("ADBKeyBoard로 입력을 전송했습니다.")
-                }
-                return true
-            }
-        }
-
-        // Priority 2: Protocol v2 RemoteImeBatchEdit(21) on port 6466
         var remoteFailure: Throwable? = null
         if (remoteClient.isConnected) {
             val imeResult = runCatching {
@@ -853,46 +843,18 @@ class RemoteViewModel(
             if (imeResult.isSuccess) {
                 lastAdbSentTextLength = 0
                 if (showSuccessMessage) {
-                    if (text.isNotEmpty() &&
-                        !NetworkAdbClient.isAsciiInputSupported(text) &&
-                        _adbKeyboardInstalled.value == false
-                    ) {
-                        _snackbarNotice.value = SnackbarNotice(
-                            message = "전송 완료 · TV 한글 미입력 시 ADBKeyBoard 설치가 필요합니다",
-                            actionLabel = "설치 안내",
-                            onAction = { openAdbKeyboardSetupDialog() }
-                        )
-                    } else {
-                        showMessage("TV로 입력을 전송했습니다.")
-                    }
+                    showMessage("TV로 입력을 전송했습니다.")
                 }
                 return true
             }
             remoteFailure = imeResult.exceptionOrNull()
         }
 
-        // Priority 3: ADB fallback (ADBKeyBoard if newly connected, else raw ASCII `input text`)
         if (!adbClient.isConnected && !host.isNullOrBlank()) {
             adbClient.connect(host, NetworkAdbClient.DEFAULT_ADB_PORT)
         }
 
         if (adbClient.isConnected) {
-            if (adbClient.hasAdbKeyboardIme()) {
-                _adbKeyboardInstalled.value = true
-                val adbKbResult = adbClient.sendViaAdbKeyboard(
-                    text = text,
-                    clearExisting = replaceExisting,
-                    submitWithEnter = submitWithEnter
-                )
-                if (adbKbResult.isSuccess) {
-                    lastAdbSentTextLength = if (submitWithEnter || text.isEmpty()) 0 else text.length
-                    if (showSuccessMessage) {
-                        showMessage("ADBKeyBoard로 입력을 전송했습니다.")
-                    }
-                    return true
-                }
-            }
-
             val clearCount = when {
                 text.isEmpty() || replaceExisting -> maxOf(lastAdbSentTextLength + 4, 20)
                 else -> 0
@@ -911,12 +873,8 @@ class RemoteViewModel(
                     }
                     return true
                 }
-            } else if (_adbKeyboardInstalled.value == false) {
-                _snackbarNotice.value = SnackbarNotice(
-                    message = "한글 전송을 위해 TV에 ADBKeyBoard 설치가 필요합니다.",
-                    actionLabel = "설치 안내",
-                    onAction = { openAdbKeyboardSetupDialog() }
-                )
+            } else {
+                showMessage("한글 전체 텍스트 전송을 위해 TV Wi-Fi 리모컨(6466) 연결을 확인하거나 아래 한글 자판을 이용해 주세요.")
                 return false
             }
         }
@@ -1258,12 +1216,12 @@ class RemoteViewModel(
     ) {
         adbClient.configureForTest(connected, shellRunner)
         if (!connected) {
-            _adbKeyboardInstalled.value = null
+            _tvImeStatus.value = TvImeStatus()
         }
     }
 
-    internal suspend fun checkAdbKeyboardOnConnectForTest() {
-        refreshAdbKeyboardStatusOnConnect()
+    internal suspend fun refreshTvImeStatusForTest(syncLanguage: Boolean = !hasUserManuallyToggledLanguage) {
+        refreshTvImeStatusInternal(syncLanguage = syncLanguage)
     }
 
     private fun ensureConnectedOrPrompt(): Boolean {

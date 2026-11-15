@@ -501,6 +501,53 @@ class AndroidTvRemoteClient(
         }
     }
 
+    /**
+     * Transmits a real-time physical key event (optionally with Ctrl / Shift held) under [imeMutex]
+     * so modifier down -> target key -> modifier up frames never interleave with subsequent key taps.
+     */
+    suspend fun sendPhysicalKey(keyCode: Int, shift: Boolean = false, ctrl: Boolean = false) {
+        imeMutex.withLock {
+            sendKeyWithModifiersLocked(keyCode = keyCode, shift = shift, ctrl = ctrl)
+        }
+    }
+
+    /**
+     * Executes "(1) Select All (Ctrl+A) -> (2) Delete (DEL)" using physical key injects.
+     */
+    suspend fun selectAllAndDelete() {
+        imeMutex.withLock {
+            sendKeyWithModifiersLocked(keyCode = TvKeyCodes.KEYCODE_A, ctrl = true)
+            kotlinx.coroutines.delay(60)
+            sendKey(TvKeyCodes.DEL, DIRECTION_SHORT)
+            trackedTvText = ""
+            trackedSelStart = 0
+            trackedSelEnd = 0
+        }
+    }
+
+    private suspend fun sendKeyWithModifiersLocked(
+        keyCode: Int,
+        shift: Boolean = false,
+        ctrl: Boolean = false
+    ) {
+        if (!shift && !ctrl) {
+            sendKey(keyCode, DIRECTION_SHORT)
+            return
+        }
+        val heldModifiers = mutableListOf<Int>()
+        if (ctrl) heldModifiers.add(TvKeyCodes.CTRL_LEFT)
+        if (shift) heldModifiers.add(TvKeyCodes.SHIFT_LEFT)
+        for (mod in heldModifiers) {
+            sendKey(mod, DIRECTION_START_LONG)
+        }
+        kotlinx.coroutines.delay(25)
+        sendKey(keyCode, DIRECTION_SHORT)
+        kotlinx.coroutines.delay(25)
+        for (mod in heldModifiers.asReversed()) {
+            sendKey(mod, DIRECTION_END_LONG)
+        }
+    }
+
     private suspend fun sendRaw(payload: ByteArray) = sendFramedBytes(ProtobufWire.frameMessage(payload))
 
     private suspend fun sendFramedBytes(framedBytes: ByteArray) = withContext(Dispatchers.IO) {

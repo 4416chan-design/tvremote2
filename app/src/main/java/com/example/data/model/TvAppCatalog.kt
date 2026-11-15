@@ -38,6 +38,58 @@ object TvKeyCodes {
     const val SPACE = 62
     const val DEL = 67
     const val ENTER = 66
+
+    // Physical keyboard keys (android.view.KeyEvent constants)
+    const val KEYCODE_0 = 7
+    const val KEYCODE_1 = 8
+    const val KEYCODE_2 = 9
+    const val KEYCODE_3 = 10
+    const val KEYCODE_4 = 11
+    const val KEYCODE_5 = 12
+    const val KEYCODE_6 = 13
+    const val KEYCODE_7 = 14
+    const val KEYCODE_8 = 15
+    const val KEYCODE_9 = 16
+
+    const val KEYCODE_A = 29
+    const val KEYCODE_B = 30
+    const val KEYCODE_C = 31
+    const val KEYCODE_D = 32
+    const val KEYCODE_E = 33
+    const val KEYCODE_F = 34
+    const val KEYCODE_G = 35
+    const val KEYCODE_H = 36
+    const val KEYCODE_I = 37
+    const val KEYCODE_J = 38
+    const val KEYCODE_K = 39
+    const val KEYCODE_L = 40
+    const val KEYCODE_M = 41
+    const val KEYCODE_N = 42
+    const val KEYCODE_O = 43
+    const val KEYCODE_P = 44
+    const val KEYCODE_Q = 45
+    const val KEYCODE_R = 46
+    const val KEYCODE_S = 47
+    const val KEYCODE_T = 48
+    const val KEYCODE_U = 49
+    const val KEYCODE_V = 50
+    const val KEYCODE_W = 51
+    const val KEYCODE_X = 52
+    const val KEYCODE_Y = 53
+    const val KEYCODE_Z = 54
+
+    const val COMMA = 55
+    const val PERIOD = 56
+    const val SHIFT_LEFT = 59
+    const val SHIFT_RIGHT = 60
+    const val MINUS = 69
+    const val EQUALS = 70
+    const val SLASH = 76
+    const val AT = 77
+    const val CTRL_LEFT = 113
+    const val MOVE_HOME = 122
+    const val MOVE_END = 123
+    const val LANGUAGE_SWITCH = 204
 }
 
 enum class CustomActionType {
